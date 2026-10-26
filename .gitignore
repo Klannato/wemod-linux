@@ -1,0 +1,15 @@
+# Python runtime cache
+__pycache__/
+*.pyc
+
+# Compiled test target (build it with gcc — see README)
+test_inject
+
+# Personal data: your Steam library + scraper intermediate state
+steam_games.tsv
+steam_games.*.txt
+steam_games.*.json
+
+# Secrets — the OpenRouter API key lives OUTSIDE the repo (see README)
+.env
+*.key
