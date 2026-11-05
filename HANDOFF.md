@@ -1,6 +1,6 @@
 # HANDOFF — WeMod-style clean UI over cheat tables
 
-Repo `~/wemod-linux` (branch master, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
+Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
 ## Goal
