@@ -396,20 +396,125 @@ def find_code_cave(pid: int, size: int, scan_limit: int = 0x40000) -> int | None
     return None
 
 
-def auto_enable(pid: int, script_text: str) -> dict:
+def auto_enable(pid: int, script_text: str, bases: dict | None = None) -> dict:
     """Full AA enable with auto-discovery — the real-game entry point.
 
-    AOB-scans the injection point (also used as the mmap carrier, since an
-    aobscanmodule target is hot code), finds a padding cave for the mmap stub,
-    then runs the script. Returns the run_aa_script handle."""
+    Two shapes exist in the wild and both are handled here:
+      * **AOB scripts** (`aobscanmodule`) — signature found at runtime, code moved
+        to an allocated cave and a jmp hook installed.
+      * **Direct-address scripts** (`assert(MODULE+OFF, bytes)` plus a
+        `MODULE+OFF:` block) — the bytes are patched in place, e.g. Far Cry 5's
+        "不被探测": `xorps xmm6,xmm6` over `F3 0F 58 73 10`. These have no AOB scan
+        at all, which used to surface as "script has no AOB scan".
+    """
     p = parse_aa(script_text)
-    if not p["aobscans"]:
-        raise ValueError("script has no AOB scan")
-    aob = p["aobscans"][0]
-    inj = aob_scan_module(pid, aob["module"] or "", aob["pattern"])
-    if inj is None:
-        raise ValueError(f"AOB not found: {aob['pattern'][:50]}")
-    stub = find_code_cave(pid, 128)
-    if stub is None:
-        raise ValueError("no code cave found for the mmap stub")
-    return run_aa_script(pid, script_text, mmap_hook=inj, mmap_stub=stub)
+    if p["aobscans"]:
+        aob = p["aobscans"][0]
+        inj = aob_scan_module(pid, aob["module"] or "", aob["pattern"])
+        if inj is None:
+            raise ValueError(f"AOB not found: {aob['pattern'][:50]}")
+        stub = find_code_cave(pid, 128)
+        if stub is None:
+            raise ValueError("no code cave found for the mmap stub")
+        return run_aa_script(pid, script_text, mmap_hook=inj, mmap_stub=stub)
+
+    if p["has_lua"]:
+        raise ValueError("Lua script — needs Cheat Engine's Lua engine, not ported")
+    if "createthread" in script_text.lower():
+        raise ValueError("script uses createthread(...) — remote thread injection is not "
+                         "implemented (needs CreateRemoteThread or a cave + hook)")
+    inplace = parse_inplace(script_text)
+    if inplace["blocks"]:
+        return apply_inplace(pid, script_text, bases)
+    raise ValueError("script has neither an AOB scan nor a direct-address block "
+                     "(nothing to enable)")
+
+
+# ------------------------------------------------------- direct-address patches
+_ASSERT_RE = re.compile(r"assert\s*\(\s*([^,]+?)\s*,\s*([0-9A-Fa-f?* ]+?)\s*\)", re.I)
+_LABEL_RE = re.compile(r"^\s*((?:[A-Za-z_][\w.$]*(?:\s*[+-]\s*[0-9A-Fa-fx]+)?)|(?:0[xX][0-9A-Fa-f]+)|(?:[0-9A-Fa-f]{6,}))\s*:\s*$")
+
+
+def _sections(text: str) -> tuple[str, str]:
+    m = re.search(r"\[ENABLE\](.*?)(?=\[DISABLE\]|$)", text, re.DOTALL)
+    enable = m.group(1) if m else text
+    m = re.search(r"\[DISABLE\](.*)", text, re.DOTALL)
+    return enable, (m.group(1) if m else "")
+
+
+def parse_inplace(text: str) -> dict:
+    """Direct-address scripts: assert(...) checks plus `module+offset:` blocks."""
+    enable, _disable = _sections(text)
+    asserts = [(m.group(1).strip(), m.group(2).strip())
+               for m in _ASSERT_RE.finditer(enable)]
+    blocks: list[dict] = []
+    current: dict | None = None
+    for raw in enable.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("//", ";", "{$")):
+            continue
+        m = _LABEL_RE.match(line)
+        if m and not line.lower().startswith("assert"):
+            current = {"expr": m.group(1).replace(" ", ""), "lines": []}
+            blocks.append(current)
+            continue
+        if current is None:
+            continue
+        if line.lower().startswith("assert("):
+            continue
+        current["lines"].append(line)
+    return {"asserts": asserts, "blocks": [b for b in blocks if b["lines"]],
+            "has_lua": "{$lua}" in text}
+
+
+def _resolve_addr(expr: str, bases: dict) -> int:
+    addr = C._base_addr(expr, bases)
+    if addr is None:
+        raise ValueError(f"cannot resolve {expr!r} (module not loaded?)")
+    return addr
+
+
+def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict:
+    """Patch bytes at absolute (module+offset) addresses; remember the originals."""
+    bases = bases or C.module_bases(pid)
+    parsed = parse_inplace(script_text)
+    patches: list[dict] = []
+    INJ.attach(pid)
+    try:
+        for expr, hexbytes in parsed["asserts"]:
+            addr = _resolve_addr(expr, bases)
+            want = bytes(int(b, 16) for b in hexbytes.split() if b not in ("?", "??", "*"))
+            got = INJ.read(pid, addr, len(want))
+            if got != want:
+                raise ValueError(
+                    f"assert failed at {expr} ({addr:#x}): expected {want.hex(' ')}, "
+                    f"found {got.hex(' ')} — the table targets a different game build")
+        for block in parsed["blocks"]:
+            addr = _resolve_addr(block["expr"], bases)
+            asm = "\n".join(_ce_normalize(line) for line in block["lines"])
+            code = INJ.assemble(asm, base_addr=addr)
+            if not code:
+                raise ValueError(f"nothing assembled for {block['expr']}")
+            orig = INJ.read(pid, addr, len(code))
+            INJ.write(pid, addr, code)
+            patches.append({"addr": addr, "orig": orig, "new": code,
+                            "expr": block["expr"], "asm": asm})
+    finally:
+        INJ.detach(pid)
+    return {"type": "inplace", "pid": pid, "patches": patches}
+
+
+def auto_disable(pid: int, handle: dict) -> None:
+    """Undo either shape: restore patched bytes, or remove the jmp hook."""
+    if handle.get("type") == "inplace":
+        INJ.attach(pid)
+        try:
+            for patch in reversed(handle.get("patches", [])):
+                INJ.write(pid, patch["addr"], patch["orig"])
+            if handle.get("cave"):
+                # scripts that also allocated a cave: leave it mapped, harmless
+                pass
+        finally:
+            INJ.detach(pid)
+        return
+    aa_disable(pid, handle)

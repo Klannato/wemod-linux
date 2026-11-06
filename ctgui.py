@@ -19,6 +19,7 @@ Run:  python3 ctgui.py
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 import dearpygui.dearpygui as dpg
@@ -34,6 +35,7 @@ import cttheme as T
 import ctwidgets as W
 
 TABLES = D.TABLES
+TRAINER_LOG = L.LOG_DIR / "trainer.log"
 CONF_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -318,7 +320,7 @@ class App:
             handle = self.enabled.pop(key, None)
             if handle:
                 try:
-                    AA.aa_disable(self.pid, handle)
+                    AA.auto_disable(self.pid, handle)
                     self.log(f"disabled: {c['description']}")
                 except Exception as exc:
                     self.log(f"disable failed: {exc}")
@@ -328,10 +330,10 @@ class App:
 
     def _enable_worker(self, c: dict, key: str) -> None:
         try:
-            handle = AA.auto_enable(self.pid, c["script"])
+            handle = AA.auto_enable(self.pid, c["script"], self.bases)
             self.q.put(("aa_ok", (key, handle, c["description"])))
         except Exception as exc:
-            self.q.put(("aa_err", (key, c["description"], str(exc))))
+            self.q.put(("aa_err", (key, c["description"], f"{type(exc).__name__}: {exc}")))
 
     def _on_value_toggle(self, c: dict, key: str, value: bool) -> None:
         sw = self.switches.get(key)
@@ -380,7 +382,7 @@ class App:
 
     def _apply_worker(self, c: dict) -> None:
         try:
-            AA.auto_enable(self.pid, c["script"])
+            AA.auto_enable(self.pid, c["script"], self.bases)
             self.q.put(("chat", f"applied: {c['description']}"))
         except Exception as exc:
             self.q.put(("chat", f"apply failed ({c['description']}): {exc}"))
@@ -570,9 +572,22 @@ class App:
 
     # ------------------------------------------------------------- plumbing
     def log(self, msg: str) -> None:
+        """Append to the pane AND to the on-disk log.
+
+        On-disk is the point: when something is reported as "error", the answer
+        has to be readable after the fact (LAUNCH_LOG below), not only while the
+        window is open.
+        """
+        line = f"{time.strftime('%H:%M:%S')} {msg}"
         self.log_lines.append(msg)
         self.log_lines = self.log_lines[-500:]
         dpg.set_value(self.log_text, "\n".join(self.log_lines))
+        try:
+            L.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(TRAINER_LOG, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
 
     def _poll(self, *_) -> None:
         try:
@@ -606,6 +621,9 @@ class App:
 
 def main() -> None:
     L.write_tracer_pid()        # for shims loaded into Steam-launched games
+    TRAINER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    TRAINER_LOG.write_text(f"=== trainer started {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                           f"(pid {__import__('os').getpid()}) ===\n", encoding="utf-8")
     dpg.create_context()
     ui = T.apply()                      # Material theme + type scale, bound globally
     app = App(ui)
