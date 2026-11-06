@@ -474,23 +474,78 @@ def _resolve_addr(expr: str, bases: dict) -> int:
     return addr
 
 
+def _find_shift(pid: int, addr: int, want: bytes, window: int = 0x8000) -> int | None:
+    """How far did this instruction move? Table drift, measured, not guessed.
+
+    Cheat tables are written against one game build. When an `assert` fails, the
+    same byte sequence is usually still present nearby (Far Cry 5's installed
+    build has it 0x1050 bytes later than the table expects). Returns the unique
+    match offset inside ±window, or None when the answer would be ambiguous —
+    patching an ambiguous address is how you crash a game.
+    """
+    lo = max(0, addr - window)
+    hi = addr + window + len(want)
+    try:
+        for region in C.parse_maps(pid):
+            if region["start"] <= addr < region["end"]:
+                if not region["perms"].startswith("r"):
+                    return None
+                lo = max(lo, region["start"])
+                hi = min(hi, region["end"])
+                break
+        if hi <= lo:
+            return None
+        blob = C.read_mem(pid, lo, hi - lo)
+    except (OSError, UnboundLocalError):
+        return None
+    hits = [i for i in range(len(blob)) if blob.startswith(want, i)]
+    if not hits:
+        return None
+    near = [lo + i for i in hits if abs((lo + i) - addr) <= 0x2000]
+    pick = near if near else [lo + i for i in hits]
+    if len(pick) != 1:
+        return None
+    return pick[0] - addr
+
+
 def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict:
     """Patch bytes at absolute (module+offset) addresses; remember the originals."""
     bases = bases or C.module_bases(pid)
     parsed = parse_inplace(script_text)
     patches: list[dict] = []
+    shift = 0
     INJ.attach(pid)
     try:
+        mismatched: list[tuple[int, bytes]] = []
         for expr, hexbytes in parsed["asserts"]:
             addr = _resolve_addr(expr, bases)
             want = bytes(int(b, 16) for b in hexbytes.split() if b not in ("?", "??", "*"))
-            got = INJ.read(pid, addr, len(want))
+            try:
+                got = INJ.read(pid, addr, len(want))
+            except OSError:
+                # address not mapped in this process: treat as a mismatch and let
+                # the drift search look for the pattern nearby
+                mismatched.append((addr, want))
+                continue
             if got != want:
+                mismatched.append((addr, want))
+        if mismatched:
+            # Try to measure the table's drift; every failed assert must agree.
+            shifts = {_find_shift(pid, a, w) for a, w in mismatched}
+            shifts.discard(None)
+            if len(shifts) != 1:
+                addr, want = mismatched[0]
+                try:
+                    found = INJ.read(pid, addr, len(want)).hex(" ")
+                except OSError:
+                    found = "unreadable address"
                 raise ValueError(
-                    f"assert failed at {expr} ({addr:#x}): expected {want.hex(' ')}, "
-                    f"found {got.hex(' ')} — the table targets a different game build")
+                    f"assert failed at {addr:#x}: expected {want.hex(' ')}, found "
+                    f"{found} — this table is for a different game build and the shift "
+                    f"is not unambiguous")
+            shift = shifts.pop()
         for block in parsed["blocks"]:
-            addr = _resolve_addr(block["expr"], bases)
+            addr = _resolve_addr(block["expr"], bases) + shift
             asm = "\n".join(_ce_normalize(line) for line in block["lines"])
             code = INJ.assemble(asm, base_addr=addr)
             if not code:
@@ -501,7 +556,7 @@ def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict
                             "expr": block["expr"], "asm": asm})
     finally:
         INJ.detach(pid)
-    return {"type": "inplace", "pid": pid, "patches": patches}
+    return {"type": "inplace", "pid": pid, "patches": patches, "shift": shift}
 
 
 def auto_disable(pid: int, handle: dict) -> None:

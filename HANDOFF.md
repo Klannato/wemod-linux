@@ -3,6 +3,20 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-06: table drift on Far Cry 5
+The Steam-launch route works (attach readable, module-owner switch to the engine
+process). The next failure is a real table/build mismatch, proven offline:
+`FC_m64.dll` RVA `0x114B512` holds `de 74 0d f0` in the installed build, while the
+table asserts `0f b6 f0 e8` — and that pattern does exist, at RVA `0x114C562`
+(delta `+0x1050`). So the address math is correct and the table was written for a
+different FC5 build.
+
+`ctaa.apply_inplace` now re-anchors on assert mismatch: it searches ±0x8000 for the
+exact byte sequence, accepts only a unique match (ambiguous ⇒ refuse), applies the
+patch at the shifted address, records the shift in the handle (logged as
+"table drift +0x1050"), and restores correctly. Tested in
+tests/test_inplace_patch.py (patch / restore / drift / bad assert / empty script).
+
 ## Status — 2026-11-05 (late): stuck wine trees
 Steam reported Far Cry 5 as running while unable to stop it. Cause: a wineserver
 answers `-k` only for the exact `WINEPREFIX` string Proton used —

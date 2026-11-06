@@ -350,6 +350,10 @@ class App:
                     pid = owner
                     self.q.put(("reattach", owner))
             handle = AA.auto_enable(pid, c["script"], self.bases)
+            shift = (handle or {}).get("shift") or 0
+            if shift:
+                self.q.put(("log", f"  table drift {shift:+#x}: patched at the shifted "
+                                   f"address (this table was made for another build)"))
             self.q.put(("aa_ok", (key, handle, c["description"])))
         except Exception as exc:
             self.q.put(("aa_err", (key, c["description"], f"{type(exc).__name__}: {exc}")))

@@ -34,13 +34,17 @@ import ctinject as INJ
 CHILD = r"""
 import ctypes, sys, time, mmap
 # RWX page so both the report address and the patch target are usable
-page = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+page = mmap.mmap(-1, 16384, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
 ORIG = bytes.fromhex("F30F58731090909090909090")
-page.write(ORIG)
+page.write(ORIG)                       # at offset 0
+DRIFT = bytes.fromhex("F30F5973109090")   # mulss, only here
+page[0x2000:0x2000+len(DRIFT)] = DRIFT  # the "other build" location
 addr = ctypes.addressof(ctypes.c_char.from_buffer(page))
 print(addr, flush=True)
 time.sleep(30)
 """
+
+DRIFT = bytes.fromhex("F30F597310")   # bytes the drift case expects at addr-0x40
 
 SCRIPT = """[ENABLE]
 assert({addr},F3 0F 58 73 10)
@@ -85,6 +89,17 @@ def main() -> int:
     restored = read(pid, addr)
     if restored != before:
         failures.append(f"disable did not restore: {restored.hex(' ')} != {before.hex(' ')}")
+
+    # table drift: table expects the instruction 0x40 earlier than this "build"
+    time.sleep(0.2)
+    drifted = (SCRIPT.format(addr=hex(addr + 0x1FC0))
+               .replace("F3 0F 58 73 10", "F3 0F 59 73 10"))
+    handle2 = AA.auto_enable(pid, drifted, bases={})
+    if not handle2.get("shift"):
+        failures.append(f"no drift detected (shift={handle2.get('shift')})")
+    AA.auto_disable(pid, handle2)
+    if read(pid, addr + 0x2000) != DRIFT[:5]:
+        failures.append("drifted patch did not restore the bytes at the shifted address")
 
     # wrong assert must refuse, not patch
     bad = SCRIPT.format(addr=hex(addr)).replace("F3 0F 58 73 10)\n\n", "AA BB CC DD EE)\n\n")
