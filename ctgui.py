@@ -93,6 +93,8 @@ class App:
                     dpg.add_button(label="Detach", tag="btn_detach", callback=self.detach)
                     dpg.add_button(label="Force stop", tag="btn_kill",
                                    callback=self.force_stop_click)
+                    dpg.add_button(label="Troubleshoot", tag="btn_trouble",
+                                   callback=self.trouble_open)
                     dpg.add_spacer(width=16)
                     self.status = dpg.add_text(default_value="not attached", tag="status")
 
@@ -181,7 +183,7 @@ class App:
         if self.ui.get("primary_button"):
             dpg.bind_item_theme("btn_launch", self.ui["primary_button"])
         for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_send",
-                     "btn_viasteam", "btn_kill", "btn_compat"):
+                     "btn_viasteam", "btn_kill", "btn_compat", "btn_trouble"):
             if self.ui.get("text_button"):
                 dpg.bind_item_theme(item, self.ui["text_button"])
         for item, role in (("app_title", "headline"), ("lbl_games", "caption"),
@@ -508,6 +510,112 @@ class App:
             self.q.put(("chat", f"applied: {c['description']}"))
         except Exception as exc:
             self.q.put(("chat", f"apply failed ({c['description']}): {exc}"))
+
+    # ------------------------------------------------------- troubleshoot wizard
+    def trouble_open(self) -> None:
+        """A guided path for a table that does not fit this game build."""
+        game = self.current_game
+        if not game:
+            self.log("select a game first")
+            return
+        if dpg.does_item_exist("trouble"):
+            dpg.delete_item("trouble")
+        with dpg.window(label=f"Troubleshoot — {game}", tag="trouble", width=720,
+                        height=470, pos=(240, 140)):
+            dpg.add_text(f"Game: {game}", tag="trouble_title")
+            dpg.add_separator()
+            dpg.add_text("Step 1 — does this table match the installed build?",
+                         tag="trouble_step1")
+            dpg.add_text("Reads each assert's bytes out of the table and compares "
+                         "them with the DLL/EXE on disk. No game launch needed.",
+                         wrap=680)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Check table", tag="btn_t_step1",
+                               callback=self.trouble_check)
+                dpg.add_text("", tag="trouble_step1_result")
+            dpg.add_separator()
+            dpg.add_text("Step 2 — is there a newer table for this build?")
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Search online", tag="btn_t_step2",
+                               callback=self.trouble_online)
+                dpg.add_button(label="Use best matching table", tag="btn_t_use",
+                               callback=self.trouble_use_best)
+            dpg.add_text("", tag="trouble_step2_result", wrap=680)
+            dpg.add_separator()
+            dpg.add_text("Step 3 — if no table fits: rebuild the cheat by observing "
+                         "the value (Find cheat panel).")
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Open Find cheat", tag="btn_t_step3",
+                               callback=self.trouble_open_find)
+            dpg.add_separator()
+            with dpg.child_window(height=140, tag="trouble_log"):
+                dpg.add_text("", tag="trouble_log_text", wrap=680)
+            dpg.add_button(label="Close", tag="btn_t_close",
+                           callback=lambda: dpg.delete_item("trouble"))
+        if self.ui.get("primary_button"):
+            dpg.bind_item_theme("btn_t_step1", self.ui["primary_button"])
+        for item in ("btn_t_step2", "btn_t_use", "btn_t_step3", "btn_t_close"):
+            if self.ui.get("text_button"):
+                dpg.bind_item_theme(item, self.ui["text_button"])
+
+    def _tlog(self, msg: str) -> None:
+        if not dpg.does_item_exist("trouble_log_text"):
+            return
+        current = dpg.get_value("trouble_log_text") or ""
+        dpg.set_value("trouble_log_text", (current + "\n" + msg).strip())
+        self.log(msg)
+
+    def trouble_open_find(self) -> None:
+        dpg.set_value("find_header", True)
+        self.log("Find cheat panel opened — scan for the value you see in game")
+
+    def trouble_check(self) -> None:
+        game = self.current_game
+        if not game:
+            return
+        dpg.set_value("trouble_step1_result", "checking…")
+        threading.Thread(target=lambda g=game: self.q.put(
+            ("trouble_check", CC.verify_game(g))), daemon=True).start()
+
+    def trouble_online(self) -> None:
+        game = self.current_game
+        if not game:
+            return
+        dpg.set_value("trouble_step2_result", "searching GitHub…")
+        threading.Thread(target=lambda g=game: self.q.put(
+            ("trouble_online", self._trouble_online_worker(g))), daemon=True).start()
+
+    def _trouble_online_worker(self, game: str) -> dict:
+        out = {"game": game, "candidates": [], "best": None}
+        try:
+            res = CC.verify_game(game, include_online=True)
+        except Exception as exc:
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            return out
+        roots = res.get("roots") or []
+        out["candidates"] = res.get("tables") or []
+        scored = [t for t in out["candidates"] if t.get("checked") and t["matched"]]
+        if scored:
+            out["best"] = max(scored, key=lambda t: t["matched"])
+        return out
+
+    def trouble_use_best(self) -> None:
+        best = getattr(self, "trouble_best", None)
+        if not best or not best.get("file"):
+            self._tlog("no scored candidate yet — press Search online first")
+            return
+        game = self.current_game
+        dest = L.LOG_DIR.parent / "tables" / game / f"new_{Path(best['file']).name}"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_bytes(Path(best["file"]).read_bytes())
+            data = CL.write_game(dest.parent)
+            self.cheats = data["cheats"]
+            self.populate_cheats()
+            self._tlog(f"installed {dest.name} ({best['matched']}/{best['checked']} "
+                       f"asserts match) — cheat list rebuilt")
+        except OSError as exc:
+            self._tlog(f"could not install the table: {exc}")
 
     # ------------------------------------------------------------- table compat
     def _compat_worker(self, game: str) -> None:
@@ -875,6 +983,40 @@ class App:
                         threading.Thread(target=self._watch_for_crash,
                                          args=(self.current_game, name, self.pid),
                                          daemon=True).start()
+                elif kind == "trouble_check":
+                    res = payload
+                    tables = res.get("tables") or []
+                    best = res.get("best") or (tables[0] if tables else None)
+                    if not best:
+                        msg = "no table found for this game"
+                    else:
+                        msg = (f"{best['matched']}/{best['checked']} asserts match "
+                               f"— {best['verdict']}")
+                        self._tlog(f"step 1: {best['table']} — {msg}")
+                        for s_ in (best.get("samples") or [])[:3]:
+                            if "rva" in s_:
+                                self._tlog(f"   {s_['module']}+{s_['rva']}: expected "
+                                           f"{s_['expected']}, found {s_['actual']}"
+                                           + (f", drift {s_['drift']}" if s_.get("drift") else ""))
+                    dpg.set_value("trouble_step1_result", msg)
+                elif kind == "trouble_online":
+                    res = payload
+                    if res.get("error"):
+                        dpg.set_value("trouble_step2_result", res["error"])
+                        self._tlog(f"step 2 failed: {res['error']}")
+                    else:
+                        cands = res.get("candidates") or []
+                        self.trouble_best = res.get("best")
+                        good = [c for c in cands if c.get("checked") and c["matched"]]
+                        dpg.set_value("trouble_step2_result",
+                                      f"{len(cands)} candidate(s); "
+                                      f"{len(good)} fit this build")
+                        for c in cands[:6]:
+                            self._tlog(f"   {c['table'][:44]:44} "
+                                       f"{c['matched']}/{c['checked']} {c['verdict']}")
+                        if self.trouble_best:
+                            self._tlog("   best candidate can be installed with "
+                                       "Use best matching table")
                 elif kind == "compat":
                     self._on_compat(payload)
                 elif kind == "aa_confirm":

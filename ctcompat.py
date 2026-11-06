@@ -23,6 +23,7 @@ import os
 import re
 import struct
 import sys
+import urllib.request
 from pathlib import Path
 
 LIB = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "ctfetch"
@@ -202,8 +203,8 @@ def score_table(path: Path, module_roots: list[Path]) -> dict:
         verdict = "partial match"
     else:
         verdict = "unchecked"
-    return {"table": path.name, "asserts": len(asserts), "checked": checked,
-            "matched": matched, "verdict": verdict,
+    return {"table": path.name, "file": str(path), "asserts": len(asserts),
+            "checked": checked, "matched": matched, "verdict": verdict,
             "consistent_drift": (f"{distinct[0]:+#x}" if len(distinct) == 1 else None),
             "drifts": [f"{d:+#x}" for d in distinct],
             "remap_safe": bool(checked and matched == checked) or len(distinct) == 1,
@@ -218,26 +219,45 @@ def verify_game(game: str, include_online: bool = False) -> dict:
         for f in sorted(local_dir.glob("*.ct")) + sorted(local_dir.glob("*.CT")):
             tables.append(score_table(f, roots))
     if include_online:
-        # Score downloads in a scratch dir: a candidate that fails the check should
-        # never end up in the game's table folder.
-        import tempfile
+        # Score downloads in a candidate cache, not in the game's table folder — a
+        # failing table must not pollute the list — but keep the file so the UI can
+        # install it after the user accepts the score.
         import ctcheck
+        cache = LIB / "candidates" / game
+        cache.mkdir(parents=True, exist_ok=True)
         try:
-            hits = ctcheck.gh_search(game)[:4]
+            hits = [h for h in ctcheck.gh_search(game)
+                    if ctcheck.matches_game(h["path"], game)][:4]
         except Exception:
             hits = []
         for hit in hits:
-            with tempfile.TemporaryDirectory() as tmp:
-                dest_dir = Path(tmp) / "tables"
-                orig = ctcheck.LIB
-                ctcheck.LIB = Path(tmp)
+            # include the repo: two collections both ship "FarCry5.CT"
+            repo = re.sub(r"[^A-Za-z0-9]+", "_", hit["repo"].split("/")[0])[:20]
+            name = f"{repo}_{Path(hit['path']).name}"
+            dest = cache / name
+            if not dest.exists():
                 try:
-                    got = ctcheck.fetch(hit, game)
-                finally:
-                    ctcheck.LIB = orig
-                if got:
-                    tables.append(score_table(got, roots))
-    best = max(tables, key=lambda t: (t["matched"], -t["checked"]), default=None)
+                    with urllib.request.urlopen(hit["url"], timeout=60) as resp:
+                        data = resp.read()
+                    if b"<CheatTable" in data[:4096]:
+                        dest.write_bytes(data)
+                except OSError:
+                    continue
+            if dest.exists():
+                tables.append(score_table(dest, roots))
+    def rank(t: dict) -> tuple:
+        """Prefer tables that fully match; then AOB-based (build-independent)."""
+        if t.get("checked") and t["matched"] == t["checked"]:
+            return (3, t["matched"])
+        if not t.get("checked"):
+            return (2, 0)
+        if t.get("matched"):
+            return (1, t["matched"])
+        return (0, 0)
+
+    for t in tables:
+        t["usable"] = rank(t)[0] >= 2
+    best = max(tables, key=rank, default=None)
     return {"game": game, "roots": [str(r) for r in roots], "tables": tables, "best": best}
 
 

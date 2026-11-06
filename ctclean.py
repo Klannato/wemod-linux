@@ -273,8 +273,28 @@ def clean_game(game_dir: Path) -> dict:
     return {"game": game_dir.name, "source_files": files, "cheats": cheats}
 
 
+def apply_translations(data: dict) -> dict:
+    """Re-attach cached English labels after a rebuild.
+
+    Rebuilding a sidecar used to drop every `description_en`, so the UI silently
+    fell back to Chinese after a table update — the translations live in a separate
+    cache and must be merged back here.
+    """
+    cache_path = CLEAN / "translations.json"
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return data
+    for cheat in data.get("cheats", []):
+        entry = cache.get(cheat.get("description", ""))
+        if entry and entry.get("english"):
+            cheat["description_en"] = entry["english"]
+            cheat["translator"] = entry.get("method", "cache")
+    return data
+
+
 def write_game(game_dir: Path) -> dict:
-    data = clean_game(game_dir)
+    data = apply_translations(clean_game(game_dir))
     CLEAN.mkdir(parents=True, exist_ok=True)
     out = CLEAN / f"{game_dir.name}.json"
     out.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
