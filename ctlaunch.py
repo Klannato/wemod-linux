@@ -290,13 +290,35 @@ def game_pid(exe_hint: Path | None, game: str, exclude: int | None = None) -> tu
     if pids:
         return pids[0], "mapped"
     needle = exe_hint.name.lower()
-    for pid in pids_for_cmdline(needle, exclude=exclude):
-        return pid, "cmdline"
+    candidates = pids_for_cmdline(needle, exclude=exclude)
+    if candidates:
+        # prefer the one wearing the shim; fall back to the first loader
+        with_shim = [p for p in candidates if shim_loaded(p)]
+        return (with_shim or candidates)[0], "cmdline"
     return None
 
 
+SHELL_COMMS = {"sh", "bash", "dash", "zsh", "reaper", "srt-bwrap", "pv-adverb",
+               "pressure-vessel-launcher", "python", "python3", "steam.sh"}
+
+
+def shim_loaded(pid: int) -> bool:
+    """Is the tracer shim mapped into this process?"""
+    try:
+        return "ptrace_allow" in Path(f"/proc/{pid}/maps").read_text(errors="replace")
+    except OSError:
+        return False
+
+
 def pids_for_cmdline(needle: str, exclude: int | None = None) -> list[int]:
-    """Wine PE processes started with this executable (skips Proton's wrapper)."""
+    """Wine PE processes started with this executable.
+
+    Shells are excluded deliberately: Steam runs the launch-options string as
+    `/bin/sh -c LD_PRELOAD=… %command%`, so the *wrapper's* command line contains
+    the game path — matching it wins the race against the game and then reports a
+    process with no shim (and no permission). That is exactly the false positive
+    seen with Far Cry 5 at 19:26:07.
+    """
     out = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -304,11 +326,14 @@ def pids_for_cmdline(needle: str, exclude: int | None = None) -> list[int]:
         pid = int(entry.name)
         if pid == exclude:
             continue
+        comm = _proc_comm(pid).lower()
+        if comm in SHELL_COMMS:
+            continue
         cmd = _proc_cmdline(pid).lower()
         if needle not in cmd:
             continue
-        comm = _proc_comm(pid).lower()
-        if comm.startswith("steam.exe") or comm.startswith("python"):
+        # a real wine PE process reports the exe (or plain "wine") as its comm
+        if not (comm.endswith(".exe") or comm.startswith("wine")):
             continue
         out.append(pid)
     return out
@@ -770,9 +795,15 @@ def launch_via_steam(game: str, timeout: float = 300.0, log=None) -> dict:
             ok, detail = trace_ok(found[0])
             say(f"  running as pid {found[0]} (Steam's child); memory access: {detail}")
             if not ok:
-                say("  this game was not launched by the trainer, so the tracer shim "
-                    "is absent: grant ptrace with `sudo setcap cap_sys_ptrace+ep` on a "
-                    "helper, or `sudo sysctl -w kernel.yama.ptrace_scope=0`")
+                if shim_loaded(found[0]):
+                    say("  the tracer shim IS loaded in this process but did not declare "
+                        "this trainer — it read a stale pid: restart the trainer (it "
+                        "rewrites ~/.cache/ct_tracer.pid) or launch the game after it")
+                else:
+                    say("  no tracer shim in this process (it is the loader/stub, not "
+                        "the game, or the Launch Options are not applied). If it never "
+                        "appears: grant ptrace with `sudo sysctl -w "
+                        "kernel.yama.ptrace_scope=0`")
             return {"ok": ok, "pid": found[0], "app": app, "via": "steam",
                     "trace": {"ok": ok, "detail": detail},
                     "error": None if ok else f"attach refused ({detail}) — Steam launched "
