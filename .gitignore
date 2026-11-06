@@ -5,6 +5,11 @@ __pycache__/
 # Compiled test target (build it with gcc — see README)
 test_inject
 
+# Built native shims (gcc -shared — see README)
+native/*.so
+native/*.o
+native/.selftest.pid
+
 # Personal data: your Steam library + scraper intermediate state
 steam_games.tsv
 steam_games.*.txt

@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-ctgui — Dear PyGui front end for wemod-linux.
+ctgui — Dear PyGui front end for wemod-linux, styled Material Design (dark).
 
 Left: game list (filterable to installed / running, with auto-attach that finds
 the game's PID by its table's target executable). Right: that game's cheats
 (toggle AA scripts, edit value cheats). Bottom: a log pane and an agent chat
 that drives the free LLM (OpenRouter) -> scanmem.
+
+"Launch & attach" starts the game through Proton with the tracer shim loaded
+(see ctlaunch.py / native/ptrace_allow.c). That is what makes the process
+traceable on a stock Ubuntu kernel: yama ptrace_scope=1 only allows tracing a
+process that named us with PR_SET_PTRACER — otherwise both process_vm_readv and
+PTRACE_ATTACH are refused with EPERM.
 
 Run:  python3 ctgui.py
 """
@@ -21,6 +27,8 @@ import ctapply as C
 import ctaa as AA
 import ctagent as G
 import ctdetect as D
+import ctlaunch as L
+import cttheme as T
 
 TABLES = D.TABLES
 
@@ -55,7 +63,8 @@ def game_cheats(game: str) -> list[dict]:
 
 
 class App:
-    def __init__(self) -> None:
+    def __init__(self, ui: dict | None = None) -> None:
+        self.ui = ui or {}
         self.pid: int | None = None
         self.bases: dict[str, int] = {}
         self.rows: list[dict] = []
@@ -67,46 +76,92 @@ class App:
         self.installed: set[str] = set()
         self.procs: dict[str, list[int]] = {}
         self.current_game: str | None = None
+        self.launched: dict | None = None
 
     # ------------------------------------------------------------- widget tree
     def build(self) -> None:
-        with dpg.window(tag="main"):
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Auto-attach", callback=self.auto_attach)
-                dpg.add_button(label="Refresh", callback=self.refresh)
-                dpg.add_button(label="Detach", callback=self.detach)
-                self.status = dpg.add_text(default_value="not attached")
-
-            with dpg.child_window(height=400):
+        with dpg.window(tag="main", label="wemod-linux"):
+            # --- app bar: title, primary action, secondary actions, status chip
+            with dpg.child_window(height=58, tag="appbar", no_scrollbar=True):
                 with dpg.group(horizontal=True):
-                    with dpg.child_window(width=340, height=-1):
-                        dpg.add_text(default_value="Games")
-                        dpg.add_input_text(tag="game_filter", hint="filter",
-                                           callback=self.refresh_games, width=-1)
-                        dpg.add_checkbox(label="Installed only", tag="installed_only",
-                                         callback=self.refresh_games)
-                        dpg.add_checkbox(label="Running only", tag="running_only",
-                                         callback=self.refresh_games)
-                        dpg.add_listbox([], tag="game_list", num_items=20, width=-1,
-                                        callback=self.on_select_game)
-                    with dpg.child_window(width=-1, height=-1):
-                        dpg.add_text(default_value="Cheats")
-                        dpg.add_listbox([], tag="cheat_list", num_items=20, width=-1)
+                    dpg.add_text("wemod-linux", tag="app_title")
+                    dpg.add_spacer(width=16)
+                    dpg.add_button(label="Launch & attach", tag="btn_launch",
+                                   callback=self.launch_and_attach)
+                    dpg.add_button(label="Auto-attach", tag="btn_auto",
+                                   callback=self.auto_attach)
+                    dpg.add_button(label="Refresh", tag="btn_refresh", callback=self.refresh)
+                    dpg.add_button(label="Detach", tag="btn_detach", callback=self.detach)
+                    dpg.add_spacer(width=16)
+                    self.status = dpg.add_text(default_value="not attached", tag="status")
+
+            dpg.add_spacer(height=8)
+
+            with dpg.child_window(height=430, tag="body"):
+                with dpg.group(horizontal=True):
+                    with dpg.child_window(width=340, height=-1, tag="left_pane"):
+                        dpg.add_text("GAMES", tag="lbl_games")
+                        dpg.add_input_text(tag="game_filter", hint="filter games",
+                                           width=-1, callback=self.refresh_games)
                         with dpg.group(horizontal=True):
-                            dpg.add_button(label="Toggle (script)", callback=self.toggle_cheat)
-                            dpg.add_button(label="Edit value", callback=self.edit_value)
+                            dpg.add_checkbox(label="Installed", tag="installed_only",
+                                             callback=self.refresh_games)
+                            dpg.add_checkbox(label="Running", tag="running_only",
+                                             callback=self.refresh_games)
+                        dpg.add_listbox([], tag="game_list", num_items=17, width=-1,
+                                        callback=self.on_select_game)
+                    with dpg.child_window(width=-1, height=-1, tag="right_pane"):
+                        dpg.add_text("CHEATS", tag="lbl_cheats")
+                        dpg.add_listbox([], tag="cheat_list", num_items=17, width=-1)
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Toggle (script)", tag="btn_toggle",
+                                           callback=self.toggle_cheat)
+                            dpg.add_button(label="Edit value", tag="btn_edit",
+                                           callback=self.edit_value)
 
             with dpg.collapsing_header(label="Log", default_open=True):
-                with dpg.child_window(height=140):
+                with dpg.child_window(height=140, tag="log_pane"):
                     self.log_text = dpg.add_text(default_value="", wrap=0)
 
             with dpg.collapsing_header(label="Agent", default_open=True):
                 with dpg.group(horizontal=True):
                     dpg.add_input_text(tag="agent_goal", hint="e.g. find the value 100 and set it to 9999",
                                        width=-1, on_enter=True, callback=self.agent_send)
-                    dpg.add_button(label="Send", callback=self.agent_send)
-                with dpg.child_window(height=150):
+                    dpg.add_button(label="Send", tag="btn_send", callback=self.agent_send)
+                with dpg.child_window(height=150, tag="chat_pane"):
                     self.chat_text = dpg.add_text(default_value="", wrap=0)
+
+        self._style()
+
+    def _style(self) -> None:
+        """Apply Material surfaces and type scale to the items just built."""
+        if not self.ui:
+            return
+        for item, level in (("appbar", 1), ("left_pane", 2), ("right_pane", 2),
+                            ("log_pane", 2), ("chat_pane", 2)):
+            dpg.bind_item_theme(item, T.elevation(level))
+        if self.ui.get("primary_button"):
+            dpg.bind_item_theme("btn_launch", self.ui["primary_button"])
+        for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_toggle",
+                     "btn_edit", "btn_send"):
+            if self.ui.get("text_button"):
+                dpg.bind_item_theme(item, self.ui["text_button"])
+        fonts = {
+            "app_title": "headline",
+            "lbl_games": "caption",
+            "lbl_cheats": "caption",
+        }
+        for item, role in fonts.items():
+            font = T.font_for(role)
+            if font:
+                dpg.bind_item_font(item, font)
+        self._chip("warn")
+
+    def _chip(self, kind: str) -> None:
+        """Recolour the status text (ok / warn / error)."""
+        theme = self.ui.get(kind)
+        if theme:
+            dpg.bind_item_theme("status", theme)
 
     # ------------------------------------------------------------- game browser
     def refresh(self) -> None:
@@ -160,7 +215,8 @@ class App:
                     self.current_game = g
                     break
         if not pids:
-            self.log("no running game found — launch the game, then Refresh")
+            self.log("no running game found — press Launch & attach (a game started "
+                     "from Steam cannot be traced on this kernel)")
             return
         self.attach(pids[0])
 
@@ -170,15 +226,72 @@ class App:
         except Exception as exc:
             self.log(f"attach {pid} failed: {exc}")
             return
+        ok, detail = L.trace_ok(pid)
         self.pid = pid
         dpg.set_value(self.status, f"attached to {pid} ({len(self.bases)} modules)")
-        self.log(f"attached to pid {pid}")
+        if ok:
+            self._chip("ok")
+            self.log(f"attached to pid {pid} — memory access {detail}")
+        else:
+            self._chip("error")
+            self.log(f"attached to pid {pid} but memory access is denied ({detail}). "
+                     f"Launch the game with Launch & attach so it declares this "
+                     f"trainer as its tracer.")
 
     def detach(self) -> None:
         self.pid = None
         self.bases = {}
         dpg.set_value(self.status, "not attached")
+        self._chip("warn")
         self.log("detached")
+
+    # ------------------------------------------------------------- launch
+    def launch_and_attach(self) -> None:
+        """Start the selected game under Proton with the tracer shim, then attach."""
+        game = self.current_game
+        if not game:
+            label = dpg.get_value("game_list")
+            if label:
+                game = label.lstrip("▶✓ ")
+        if not game:
+            self.log("select a game first")
+            return
+        app = L.find_app(game)
+        if app is None:
+            self.log(f"'{game}' is not installed through Steam — cannot launch it")
+            return
+        proton = L.find_proton()
+        if proton is None:
+            self.log("no Proton installation found")
+            return
+        self.log(f"launching {game} via {proton.parent.name} "
+                 f"(tracer shim: {L.SHIM.name})")
+        self._chip("warn")
+        dpg.set_value(self.status, f"launching {game}…")
+        threading.Thread(target=self._launch_worker, args=(game,), daemon=True).start()
+
+    def _launch_worker(self, game: str) -> None:
+        try:
+            res = L.launch(game, wait=True, timeout=240.0)
+        except Exception as exc:
+            self.q.put(("launch", {"ok": False, "error": repr(exc), "game": game}))
+            return
+        res["game"] = game
+        self.q.put(("launch", res))
+
+    def _on_launch(self, res: dict) -> None:
+        game = res.get("game", "?")
+        if not res.get("ok"):
+            self.log(f"launch failed: {res.get('error')}")
+            dpg.set_value(self.status, "launch failed")
+            self._chip("error")
+            return
+        self.launched = res
+        pid = res.get("pid")
+        trace = (res.get("trace") or {}).get("detail", "?")
+        self.log(f"{game} is running (pid {pid}); tracer access {trace}")
+        self.current_game = game
+        self.attach(int(pid))
 
     # ------------------------------------------------------------- cheats
     def _selected_index(self) -> int | None:
@@ -251,12 +364,20 @@ class App:
             self.log(f"read failed: {exc}")
             return
         self.edit_row = (addr, size)
-        with dpg.window(label=f"Edit value — {r['path']}", modal=True, width=340, height=130, tag="edit_modal"):
+        if dpg.does_item_exist("edit_modal"):
+            dpg.delete_item("edit_modal")
+        with dpg.window(label=f"Edit value — {r['path']}", modal=True, width=360,
+                        height=150, tag="edit_modal", pos=(420, 240)):
             dpg.add_text(default_value=f"address {addr:#x}, current {cur}")
             dpg.add_input_text(tag="edit_input", default_value=str(cur), width=-1)
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Write", callback=self.write_value)
-                dpg.add_button(label="Cancel", callback=lambda: dpg.delete_item("edit_modal"))
+                dpg.add_button(label="Write", tag="btn_write", callback=self.write_value)
+                dpg.add_button(label="Cancel", tag="btn_cancel",
+                               callback=lambda: dpg.delete_item("edit_modal"))
+        if self.ui.get("primary_button"):
+            dpg.bind_item_theme("btn_write", self.ui["primary_button"])
+        if self.ui.get("text_button"):
+            dpg.bind_item_theme("btn_cancel", self.ui["text_button"])
 
     def write_value(self) -> None:
         try:
@@ -310,6 +431,8 @@ class App:
                 elif kind == "aa_err":
                     key, name, err = payload
                     self.log(f"script enable failed ({name}): {err}")
+                elif kind == "launch":
+                    self._on_launch(payload)
         except queue.Empty:
             pass
         dpg.set_frame_callback(dpg.get_frame_count() + 1, self._poll)
@@ -317,9 +440,10 @@ class App:
 
 def main() -> None:
     dpg.create_context()
-    app = App()
+    ui = T.apply()                      # Material theme + type scale, bound globally
+    app = App(ui)
     app.build()
-    dpg.create_viewport(title="wemod-linux", width=1250, height=820)
+    dpg.create_viewport(title="wemod-linux", width=1250, height=860)
     dpg.setup_dearpygui()
     dpg.show_viewport()
     dpg.set_primary_window("main", True)

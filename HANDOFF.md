@@ -3,6 +3,30 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-05
+**Option 1 (trainer launches the game) is built and verified.** Files: `ctlaunch.py`,
+`native/ptrace_allow.c` (+ built `native/ptrace_allow.so`), `cttheme.py`,
+`tests/test_ptrace_allow.py`, `tests/test_wine_preload.py`, `tests/test_theme.py`,
+`tests/test_gui_render.py`; GUI restyled Material Design dark, with a
+**Launch & attach** button that starts the game through Proton, waits for the PE
+process, verifies memory access, then attaches.
+
+What was measured on this box (`ptrace_scope=1`, no capabilities):
+
+| Probe | Result |
+|---|---|
+| `process_vm_readv` / `/proc/pid/mem` on an unrelated process | EPERM / denied |
+| same on our own child | OK — **so the old "readv needs no ptrace" note was wrong; Yama gates it** |
+| same on a child that double-forked (ppid=1) | EPERM — "be the parent" is not enough |
+| shim with only `PR_SET_PTRACER` in a real Wine process | **still EPERM** |
+| shim with `PR_SET_PTRACER` + `PR_SET_DUMPABLE=1` + 1 Hz re-apply | **readable, 64-bit Wine processes** |
+
+Two traps worth remembering: the Yama ptracer relation is per-task and is **not
+inherited across fork** (needs `pthread_atfork`, and Wine re-marks processes
+non-dumpable after our constructor runs, hence the watchdog thread); and a 64-bit
+`.so` `LD_PRELOAD`ed into a 32-bit Wine process is ignored ("wrong ELF class"),
+so 32-bit-only games stay untraceable until a `-m32` shim is built.
+
 ## Goal
 Two workstreams, in this order:
 
@@ -90,6 +114,9 @@ Drop `GroupHeader` entries from the cheat list but keep them as `category`. Norm
 **A4. `ctui_clean.py` (new DPG tab in `ctgui.py`)** — game list left (reuse `ctdetect.scan_games` for ✓ installed / ▶ running); right pane: attach status banner (`Attached to DOOM.exe (pid 1234)` or "Not attached — press Auto-attach"), live search, collapsible category headers, rows of `label … control`. `script` and 0/1 `Byte` ⇒ toggle; numeric ⇒ input + set; unresolvable ⇒ greyed read-only with the reason on hover. Lua (`{$lua}`) scripts get a disabled toggle and the reason inline (`ctaa` has no CE Lua engine). Reuse the existing worker-thread + queue-polled-by-frame-callback pattern; keep attach single-threaded. Per-game `state.json` so reattach re-applies previously-enabled toggles.
 
 ## Order of work
+0. ~~Trace permission~~ **done** — trainer is the launcher, shim declares it as
+   tracer; verified with `tests/test_ptrace_allow.py` and
+   `tests/test_wine_preload.py`.
 1. **B7 harness + B2 evaluator** — makes the rest testable.
 2. **B1 symbol registry, B3 module/PE rebasing, B4 guarded walk** — resolution actually works.
 3. **B5 cache** — keeps the UI responsive.
@@ -105,7 +132,8 @@ Each step is its own commit; `HANDOFF.md` stays current as the resume point.
 - Should enabling a script implicitly to display a child value be opt-in (safer) or automatic (WeMod-like)? Default: automatic, logged.
 
 ## Constraints
-- No passwordless sudo; ptrace needs `ptrace_scope=0` or root. AA injection is blocked under default Yama — the UI must say `AA injection blocked: sudo sysctl -w kernel.yama.ptrace_scope=0` as a banner, not a stack trace. `process_vm_readv`/`writev` (value edits) needs no ptrace.
+- No passwordless sudo needed any more for the normal flow: the trainer launches the game and the shim grants trace access with `ptrace_scope` left at 1. `ptrace_scope=0` / `setcap cap_sys_ptrace+ep` are fallbacks only for attaching to a game started elsewhere. AA injection under default Yama is blocked only for those externally-started games — the UI says so in a banner, not a stack trace. `process_vm_readv`/`writev` needs the same permission (verified), so the shim gates value edits too.
+- 32-bit Wine processes do not load the 64-bit shim ("wrong ELF class"); needs a `-m32` build (gcc-multilib) before 32-bit games can be traced.
 - DPG 2.x installed via `--break-system-packages`. Never call `dpg.get_dearpygui_version()` — it segfaults.
 - CET shadow-stack: never `setrip`; injected code runs only through a jmp hook (`ctinject` pitfall, already documented).
 - Keep originals under `~/.local/share/ctfetch/tables/` byte-identical. Verify with `git status` in the repo and directory mtimes, not by eyeballing.

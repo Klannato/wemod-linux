@@ -26,8 +26,9 @@ Python 3, no daemons, no root (except one `sysctl` for ptrace — see below).
 
 | Layer | Library / technique |
 |---|---|
-| Memory read/write | `process_vm_readv` / `process_vm_writev` (no ptrace needed for values) |
+| Memory read/write | `process_vm_readv` / `process_vm_writev` (same-uid; still gated by Yama — see below) |
 | Code injection | `ptrace` (`ATTACH`/`POKEDATA`/`GETREGS`) + remote `mmap` code caves |
+| Trace permission | `native/ptrace_allow.so` — `PR_SET_PTRACER` + `PR_SET_DUMPABLE` from inside the game |
 | AOB scanning | own compiler (`??` / `*` wildcards) over `/proc/<pid>/maps` |
 | Assembly / disasm | `keystone` (assemble) + `capstone` (RIP-relative fixup) |
 | Scan mode | `scanmem` driven over a pty |
@@ -47,6 +48,9 @@ Python 3, no daemons, no root (except one `sysctl` for ptrace — see below).
 | `ctinject.py` | ptrace injection primitives + keystone + remote `mmap` code caves |
 | `ctagent.py` | OpenRouter free-model agent (`scan` / `translate`) |
 | `ctdetect.py` | Running/installed-game detection (PID finder + Steam library) |
+| `ctlaunch.py` | Launches a Steam game under Proton with the tracer shim loaded |
+| `cttheme.py` | Material Design (dark) theme + type scale for the GUI |
+| `native/ptrace_allow.c` | `LD_PRELOAD` shim: lets the trainer trace a game it launched |
 | `ctgui.py` | Dear PyGui front end (games, cheats, log, agent chat) |
 | `test_inject.c` / `test_target.py` | Test targets for the injection and scan layers |
 
@@ -63,8 +67,22 @@ python3 -m pip install --break-system-packages keystone-engine capstone dearpygu
 mkdir -p ~/.config/ctagent && echo "sk-or-..." > ~/.config/ctagent/api_key
 ```
 
-One-time kernel setting so you can attach to games you didn't spawn
-(scanmem and injection both use ptrace):
+One-time build of the tracer shim (no root, no sysctl):
+
+```bash
+gcc -shared -fPIC -O2 -o native/ptrace_allow.so native/ptrace_allow.c -lpthread
+```
+
+Why it is needed: Ubuntu ships `kernel.yama.ptrace_scope=1`, so a process may only
+be traced by its own descendants — and `process_vm_readv` is gated by the same
+check. Wine's `wineserver` reparents the game out of our subtree, so "launch it
+as a child" is not enough. The shim is `LD_PRELOAD`ed into the game by
+`ctlaunch.py`; it declares the trainer as its tracer with
+`prctl(PR_SET_PTRACER, ...)` and restores `PR_SET_DUMPABLE` (Wine clears it),
+which the kernel honours with `ptrace_scope` still at 1.
+
+Optional, only if you want to attach to games started *from Steam* instead of
+from the trainer — this weakens the machine for every app you run:
 
 ```bash
 sudo sysctl kernel.yama.ptrace_scope=0
@@ -83,9 +101,13 @@ python3 ctapply.py list ~/.local/share/ctfetch/tables/"No Man's Sky"/some.CT
 python3 ctapply.py modules <PID>                           # list module bases
 ```
 
-GUI flow: launch a game → **Refresh** → **Auto-attach** (finds the PID) → pick
-the game → toggle a script cheat or edit a value → or ask the agent "find 100 and
-set it to 9999".
+GUI flow: pick a game → **Launch & attach** (starts it through Proton with the
+tracer shim, waits for the process, verifies memory access, attaches) → toggle a
+script cheat or edit a value → or ask the agent "find 100 and set it to 9999".
+
+For a game you started yourself (Steam, Desktop), **Auto-attach** still finds the
+PID, but on a stock kernel the read will be refused — the log says so explicitly
+rather than dying on a stack trace. Launch from the trainer in that case.
 
 The library lands in `~/.local/share/ctfetch/` (`index.json` +
 `tables/<Game>/*.ct`); the API key lives in `~/.config/ctagent/api_key`
@@ -93,8 +115,14 @@ The library lands in `~/.local/share/ctfetch/` (`index.json` +
 
 ## Troubleshooting
 
-- **`attach failed` / ptrace EPERM** — run the `sysctl` above, or launch the game
-  as a child of the tool, or run as root.
+- **`attach failed` / ptrace EPERM** — expected for a game started outside the
+  trainer: `ptrace_scope=1` only allows descendants, and Wine daemonises the
+  game away from you. Use **Launch & attach**. If you must attach to an
+  already-running Steam game, either `sudo sysctl kernel.yama.ptrace_scope=0`
+  (machine-wide) or `sudo setcap cap_sys_ptrace+ep` on a narrow helper.
+- **32-bit games** — `LD_PRELOAD` of a 64-bit `.so` into a 32-bit Wine process is
+  ignored ("wrong ELF class"), so those processes stay untraceable. Needs a
+  `-m32` build of `native/ptrace_allow.c` (gcc-multilib) and a 32-bit shim path.
 - **`AOB not found`** — the table targets a different game build than the one
   installed. Cheat tables are version-specific; try another table or a newer one.
 - **Agent returns nothing / errors** — check `~/.config/ctagent/api_key`; the
@@ -118,17 +146,38 @@ are validated as real `CheatTable` XML before being accepted.
   `@f`/`@b` anonymous-label branches.
 - AOB signatures are build-specific; a game patch breaks them until the table is
   updated.
-- Direct-address value cheats read/write via `process_vm_readv` (same-uid only);
-  injection needs ptrace.
+- Direct-address value cheats read/write via `process_vm_readv`; the kernel gates
+  that on the same check as ptrace, so the game must have been launched by the
+  trainer (or ptrace relaxed).
+- 88% of table entries address memory by an Auto Assembler *symbol* that only
+  exists once the table's own script has run — see `HANDOFF.md` for the planned
+  symbol registry.
 
 ## Tests
 
-No CI suite — the harness is the two test targets, run manually:
+No CI suite — everything runs manually:
 
 ```bash
+# tracer shim: control (denied) vs shimmed (allowed), fork and exec shapes
+python3 tests/test_ptrace_allow.py
+
+# shim inside a real Wine process (uses Proton's bundled wine, throwaway prefix)
+python3 tests/test_wine_preload.py
+
+# Material theme + font loading, headless (no viewport)
+python3 tests/test_theme.py
+
+# GUI renders N frames then exits (needs a display)
+python3 tests/test_gui_render.py 120
+
+# scan target for the injection layer
 gcc -no-pie -O0 -fcf-protection=none -z execstack -o test_inject test_inject.c
-python3 test_target.py &   # scan target (holds 1234567, sets PR_SET_PTRACER)
+python3 test_target.py &
 ```
+
+`test_ptrace_allow.py` is the load-bearing one: it proves the control case is
+refused and that both detach shapes (fork+exec, fork-only) become traceable, and
+it fails loudly if someone "simplifies" the shim back to a bare `PR_SET_PTRACER`.
 
 The injection path (`ctaa`/`ctinject`) is exercised by running `auto_enable`
 against `test_inject` — AOB scan, forward-label resolution, RIP-relative fixup,
