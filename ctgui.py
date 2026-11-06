@@ -325,7 +325,7 @@ class App:
                 except Exception as exc:
                     self.log(f"disable failed: {exc}")
             return
-        self.log(f"enabling {c['description']} (AOB scan + inject)…")
+        self.log(f"enabling {c['description']}…")
         threading.Thread(target=self._enable_worker, args=(c, key), daemon=True).start()
 
     def _enable_worker(self, c: dict, key: str) -> None:
