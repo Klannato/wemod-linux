@@ -514,6 +514,7 @@ def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict
     parsed = parse_inplace(script_text)
     patches: list[dict] = []
     shift = 0
+    remap_info: dict | None = None
     INJ.attach(pid)
     try:
         mismatched: list[tuple[int, bytes]] = []
@@ -533,6 +534,18 @@ def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict
             # Try to measure the table's drift; every failed assert must agree.
             shifts = {_find_shift(pid, a, w) for a, w in mismatched}
             shifts.discard(None)
+            if len(shifts) != 1:
+                # Local drift was ambiguous — fall back to the remap engine, which
+                # searches the whole module for a longer signature from the table.
+                try:
+                    import ctremap
+                    found = ctremap.remap(pid, script_text)
+                except Exception:
+                    found = None
+                if found:
+                    remap_info = found
+                    shift = found["addr"] - mismatched[0][0]
+                    shifts = {shift}
             if len(shifts) != 1:
                 addr, want = mismatched[0]
                 try:
@@ -556,7 +569,8 @@ def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict
                             "expr": block["expr"], "asm": asm})
     finally:
         INJ.detach(pid)
-    return {"type": "inplace", "pid": pid, "patches": patches, "shift": shift}
+    return {"type": "inplace", "pid": pid, "patches": patches, "shift": shift,
+            "remap": remap_info}
 
 
 def auto_disable(pid: int, handle: dict) -> None:

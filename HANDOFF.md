@@ -3,6 +3,25 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-06: remap engine (agent fallback)
+`ctremap.py` re-locates a cheat when the table's address no longer exists and the
+local ±0x8000 drift search is ambiguous. Evidence ladder, longest first: the hex
+comment table authors paste (`//F3 0F 5E F7 …`, 20 bytes in FC5's scripts), then
+DISABLE `DB` bytes, then the assert bytes. Confidence rules: unique hit across the
+module's readable mappings, signature must contain the assert bytes (that locates
+the patch point inside it), and nothing under 8 bytes is ever trusted. The patch
+is applied at the derived address and the evidence is recorded in the handle and
+logged ("re-mapped with a 20-byte hex-comment signature").
+
+Verified in tests/test_remap.py: a mapped `FakeModule.dll` with garbage at the
+table's address, a decoy assert (making drift ambiguous) and one unique 20-byte
+signature — the patch lands on the signature-derived address and restores.
+
+Not built yet, explicitly: **string/xref-driven discovery** (search memory for
+"Invincible"/"GodMode"-style strings, then disassemble `.text` for
+`lea reg,[rip+str]` references) and an automatic "is there a newer table?" step
+before remapping. Those are the next two pieces.
+
 ## Status — 2026-11-06: table drift on Far Cry 5
 The Steam-launch route works (attach readable, module-owner switch to the engine
 process). The next failure is a real table/build mismatch, proven offline:

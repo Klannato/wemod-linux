@@ -351,6 +351,10 @@ class App:
                     self.q.put(("reattach", owner))
             handle = AA.auto_enable(pid, c["script"], self.bases)
             shift = (handle or {}).get("shift") or 0
+            remap = (handle or {}).get("remap")
+            if remap:
+                self.q.put(("log", f"  re-mapped with a {remap['signature_len']}-byte "
+                                   f"{remap['source']} signature (unique match)"))
             if shift:
                 self.q.put(("log", f"  table drift {shift:+#x}: patched at the shifted "
                                    f"address (this table was made for another build)"))
