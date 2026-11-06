@@ -396,6 +396,98 @@ def diagnose(log_path: Path | str | None, tail: int = 200) -> list[str]:
     return [hint for pattern, hint in DIAGNOSES if pattern.search(text)]
 
 
+def wine_prefix(app: dict) -> Path:
+    """Proton's WINEPREFIX for this app: `<compatdata>/<appid>/pfx/` (with the
+    trailing slash Proton itself uses — a wineserver started with a different
+    prefix string will not answer `-k`, which is why Steam sometimes "cannot"
+    stop a game)."""
+    return app["steamapps"] / "compatdata" / app["appid"] / "pfx"
+
+
+def _env_prefix(pid: int) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    for chunk in raw.split(b"\0"):
+        if chunk.startswith(b"WINEPREFIX="):
+            return chunk[len(b"WINEPREFIX="):].decode(errors="replace").rstrip("/")
+    return None
+
+
+def _pids_with_prefix(prefix: Path) -> list[int]:
+    want = str(prefix).rstrip("/")
+    out = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if _env_prefix(pid) == want:
+            out.append(pid)
+    return out
+
+
+def force_stop(game: str, log=None, app: dict | None = None) -> dict:
+    """Kill a wine tree the normal way won't: game processes + its wineserver.
+
+    `steam -applaunch` can leave Far Cry 5 running with Steam unable to stop it,
+    because the wineserver answers only to the exact WINEPREFIX string Proton
+    started it with. This kills every process carrying that prefix and asks the
+    wineserver to quit, escalating to SIGKILL.
+    """
+    def say(msg: str) -> None:
+        if log:
+            log(msg)
+
+    app = app or find_app(game)
+    if app is None:
+        return {"ok": False, "error": f"'{game}' is not an installed Steam app"}
+    prefix = wine_prefix(app)
+    exe = find_exe(app, game)
+    killed: list[int] = []
+
+    targets = set(_pids_with_prefix(prefix))
+    found = game_pid(exe, game)
+    if found:
+        targets.add(found[0])
+
+    for sig in (15, 9):
+        alive = [p for p in targets if Path(f"/proc/{p}").exists()]
+        if not alive:
+            break
+        for pid in alive:
+            try:
+                os.kill(pid, sig)
+                killed.append(pid)
+                say(f"  sent SIG{'TERM' if sig == 15 else 'KILL'} to {pid}")
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                say(f"  no permission to signal {pid} (not ours?)")
+        time.sleep(2.0)
+
+    wineserver = None
+    proton = find_proton()
+    if proton is not None:
+        candidates = list(proton.parent.glob("files/bin/wineserver"))
+        wineserver = candidates[0] if candidates else None
+    if wineserver and wineserver.exists():
+        env = dict(os.environ, WINEPREFIX=str(prefix) + "/")
+        for flag in ("-k", "-k9"):
+            try:
+                subprocess.run([str(wineserver), flag], env=env, timeout=10,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                say(f"  wineserver {flag} on {prefix}")
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    time.sleep(1.0)
+    left = _pids_with_prefix(prefix)
+    say(f"  {len(killed)} signal(s) sent; {len(left)} process(es) still carry the prefix")
+    return {"ok": not left, "prefix": str(prefix), "signalled": killed, "remaining": left,
+            "error": None if not left else f"{len(left)} process(es) survived"}
+
+
 def launch(game: str, exe: Path | None = None, timeout: float = 120.0,
            wait: bool = True, log=None) -> dict:
     """Start `game` under Proton with the tracer shim; return what happened.
@@ -500,16 +592,10 @@ def launch(game: str, exe: Path | None = None, timeout: float = 120.0,
     if pid is None:
         # Nothing appeared: do not leave a hung Proton/wine tree behind (this is
         # exactly how a failed Far Cry 5 launch ended up "still running borked").
-        cleaned = False
-        if child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=8)
-                cleaned = True
-            except Exception:
-                child.kill()
-                cleaned = True
-        say2(f"  cleanup: launcher {'stopped' if cleaned else 'already gone'}")
+        killed = force_stop(game, log=say2, app=app)
+        cleaned = bool(killed.get("signalled")) or killed.get("ok")
+        say2(f"  cleanup: {len(killed.get('signalled') or [])} process(es) signalled; "
+             f"{len(killed.get('remaining') or [])} left holding the prefix")
         result.update(ok=False, error="game process never appeared "
                                      f"({'launcher process stopped' if cleaned else 'launcher already gone'})")
         result["diagnosis"] = diagnose(log_path)

@@ -3,6 +3,18 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-05 (late): stuck wine trees
+Steam reported Far Cry 5 as running while unable to stop it. Cause: a wineserver
+answers `-k` only for the exact `WINEPREFIX` string Proton used —
+`…/compatdata/<appid>/pfx/` **with the trailing slash**; with any other string the
+request silently does nothing (this also bit my first manual cleanup). Added
+`ctlaunch.force_stop()` — signals every process whose `/proc/<pid>/environ`
+carries that prefix (SIGTERM, then SIGKILL), runs `wineserver -k` and `-k9` with
+the exact string, and reports survivors — plus a **Force stop** button, and the
+launch timeout now force-stops the whole tree instead of only the proton parent.
+Verified in `tests/test_force_stop.py`: a 10-process wine tree under a fresh prefix
+is fully removed.
+
 ## Status — 2026-11-05 (late): ptrace permission settled without root
 Tried the "narrow setcap'd helper" (`native/ctptrace.c`): **it cannot work**.
 `PR_CAP_AMBIENT_RAISE` needs the cap in the process *inheritable* set, which only

@@ -83,6 +83,8 @@ class App:
                                    callback=self.auto_attach)
                     dpg.add_button(label="Refresh", tag="btn_refresh", callback=self.refresh)
                     dpg.add_button(label="Detach", tag="btn_detach", callback=self.detach)
+                    dpg.add_button(label="Force stop", tag="btn_kill",
+                                   callback=self.force_stop_click)
                     dpg.add_spacer(width=16)
                     self.status = dpg.add_text(default_value="not attached", tag="status")
 
@@ -141,7 +143,8 @@ class App:
             dpg.bind_item_theme(item, T.elevation(level))
         if self.ui.get("primary_button"):
             dpg.bind_item_theme("btn_launch", self.ui["primary_button"])
-        for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_send", "btn_viasteam"):
+        for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_send",
+                     "btn_viasteam", "btn_kill"):
             if self.ui.get("text_button"):
                 dpg.bind_item_theme(item, self.ui["text_button"])
         for item, role in (("app_title", "headline"), ("lbl_games", "caption"),
@@ -462,6 +465,25 @@ class App:
         res["game"] = game
         self.q.put(("launch", res))
 
+    def force_stop_click(self) -> None:
+        """Kill the game's wine tree — for the state Steam cannot stop."""
+        game = self.current_game or (dpg.get_value("game_list") or "").lstrip("▶✓ ")
+        if not game:
+            self.log("select a game first")
+            return
+        self.log(f"force-stopping {game} (SIGTERM → SIGKILL → wineserver -k/-k9)")
+        threading.Thread(target=lambda g=game: self.q.put(
+            ("forcestop", dict(L.force_stop(g, log=lambda m: self.q.put(("log", m))), game=g))),
+            daemon=True).start()
+
+    def _on_force_stop(self, res: dict) -> None:
+        game = res.get("game", "?")
+        if res.get("ok"):
+            self.log(f"{game}: stopped ({len(res.get('signalled') or [])} signals, no processes left)")
+            self.detach()
+        else:
+            self.log(f"{game}: {res.get('error')} (prefix {res.get('prefix')})")
+
     def launch_via_steam_click(self) -> None:
         game = self.current_game or (dpg.get_value("game_list") or "").lstrip("▶✓ ")
         if not game:
@@ -561,6 +583,8 @@ class App:
                     self._on_launch(payload)
                 elif kind == "steamlaunch":
                     self._on_steam_launch(payload)
+                elif kind == "forcestop":
+                    self._on_force_stop(payload)
         except queue.Empty:
             pass
         dpg.set_frame_callback(dpg.get_frame_count() + 1, self._poll)

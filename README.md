@@ -165,6 +165,12 @@ The library lands in `~/.local/share/ctfetch/` (`index.json` +
   game away from you. Use **Launch & attach**. If you must attach to an
   already-running Steam game, either `sudo sysctl kernel.yama.ptrace_scope=0`
   (machine-wide) or `sudo setcap cap_sys_ptrace+ep` on a narrow helper.
+- **Steam can't stop a game / it stays "running"** — the wineserver only answers
+  `-k` for the exact `WINEPREFIX` string Proton launched it with
+  (`…/compatdata/<appid>/pfx/`, trailing slash included). Use **Force stop** in the
+  GUI: it signals every process carrying that prefix (SIGTERM → SIGKILL) and then
+  runs `wineserver -k` / `-k9` with the right string. A launch that times out does
+  this automatically.
 - **32-bit games** — `LD_PRELOAD` of a 64-bit `.so` into a 32-bit Wine process is
   ignored ("wrong ELF class"), so those processes stay untraceable. Needs a
   `-m32` build of `native/ptrace_allow.c` (gcc-multilib) and a 32-bit shim path.
