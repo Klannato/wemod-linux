@@ -124,28 +124,56 @@ def find_proton() -> Path | None:
     return max(candidates, key=rank)
 
 
+EXE_BLACKLIST = re.compile(
+    r"installer|install|setup|redist|vcredist|vc_redist|dxsetup|dxwebsetup|dotnet|"
+    r"unins|crashreport|crashpad|breakpad|ubisoftconnect|uplay|eac|easyanticheat|"
+    r"battleye|steamworks|touchup|cleanup|activate", re.I)
+
+
+def _usable(p: Path) -> bool:
+    return p.is_file() and not EXE_BLACKLIST.search(p.stem)
+
+
 def find_exe(app: dict, game: str) -> Path | None:
-    """The game's main executable: prefer the name the cheat tables target."""
+    """The game's main executable.
+
+    "Largest .exe under the install dir" is wrong and was how Far Cry 5 got
+    launched as its 262 MB Ubisoft Connect *installer* instead of the 215 KB
+    `bin/FarCry5.exe` stub. Order: the name the cheat tables target → the name
+    matching the install directory → anything under bin/ → largest remaining
+    non-blacklisted. Installers/redistributables are excluded outright.
+    """
     if not app["path"].exists():
         return None
     exes = []
     for p in app["path"].rglob("*.exe"):
         try:
-            if p.stat().st_size > 100_000:
+            if p.stat().st_size > 20_000 and _usable(p):
                 exes.append(p)
         except OSError:
             continue
     if not exes:
         return None
+
     wanted = {n.lower() for n in D.game_exe_names(game)}
-    exact = [p for p in exes if p.stem.lower() in wanted or p.name.lower() in wanted]
-    if exact:
-        return max(exact, key=lambda p: p.stat().st_size)
-    partial = [p for p in exes if any(w and w in p.stem.lower() for w in wanted)]
-    if partial:
-        return max(partial, key=lambda p: p.stat().st_size)
-    # No table hint: the biggest exe is usually the game, not the redistributable.
-    return max(exes, key=lambda p: p.stat().st_size)
+    for pool in (
+        [p for p in exes if p.stem.lower() in wanted or p.name.lower() in wanted],
+        [p for p in exes if p.stem.lower() == app["installdir"].lower()],
+        [p for p in exes if any(w and w in p.stem.lower() for w in wanted)],
+        [p for p in exes if p.parent.name.lower() in ("bin", "binaries", "game", "win64")],
+        exes,
+    ):
+        if pool:
+            return max(pool, key=lambda p: p.stat().st_size)
+    return None
+
+
+def blacklisted_exes(app: dict) -> list[str]:
+    """What got skipped — shown when a launch target cannot be found."""
+    if not app["path"].exists():
+        return []
+    return sorted(p.name for p in app["path"].rglob("*.exe")
+                  if p.is_file() and EXE_BLACKLIST.search(p.stem))
 
 
 # ---------------------------------------------------------------- environment
@@ -186,18 +214,73 @@ def trace_ok(pid: int) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def wait_for_game(game: str, child: subprocess.Popen, timeout: float = 180.0) -> int | None:
-    """Poll for the game's PE process; its tree may be reparented by wineserver."""
+def pids_for_exe(exe_name: str) -> list[int]:
+    """PIDs that have this executable *mapped* — i.e. the process running it.
+
+    Matching the cmdline is not enough and actively misleading: our own shell
+    commands mention the exe path, and Proton's `steam.exe` wrapper carries it as
+    an argument while the game binary has not loaded yet. A mapped-file hit means
+    the PE image is actually loaded (wine maps it into the host process).
+    """
+    needle = exe_name.lower()
+    out = []
+    me = os.getpid()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me:
+            continue
+        try:
+            maps = (entry / "maps").read_text(errors="replace")
+        except OSError:
+            continue
+        low = maps.lower()
+        if needle in low and ("wine" in low or "/steamapps/" in low):
+            out.append(pid)
+    return out
+
+
+def wait_for_game(game: str, child: subprocess.Popen, timeout: float = 180.0,
+                  exe_hint: Path | None = None) -> int | None:
+    """Poll for the game's PE process; its tree may be reparented by wineserver.
+
+    Cheat-table exe names only exist when a table has an `aobscanmodule` (Far
+    Cry 5's is symbol-based, so it has none) — hence the exe_hint fallback, which
+    matches the process by the executable we actually launched.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         procs = D.find_processes()
         pids = D.running_pids(game, procs)
+        if not pids and exe_hint is not None:
+            pids = [p for p in pids_for_exe(exe_hint.name) if p != child.pid]
         if pids:
             return pids[0]
         if child.poll() is not None:
             return None
         time.sleep(1.0)
     return None
+
+
+def steam_running() -> bool:
+    """Is the Steam client up? Steamworks titles abort without it.
+
+    Measured on Far Cry 5: launched straight through Proton it exits with
+    `err:steamclient:steamclient_init_registry Failed to connect to Steam`, with
+    or without the right executable. The client supplies the IPC the game's
+    steam_api shim needs, so this is a precondition, not a nicety.
+    """
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if comm in ("steam", "steamwebhelper", "steam.sh"):
+            return True
+    return False
 
 
 def launch(game: str, exe: Path | None = None, timeout: float = 180.0,
@@ -211,7 +294,20 @@ def launch(game: str, exe: Path | None = None, timeout: float = 180.0,
         return {"ok": False, "error": "no Proton installation found"}
     target = exe or find_exe(app, game)
     if target is None:
-        return {"ok": False, "error": f"no executable found under {app['path']}"}
+        skipped = blacklisted_exes(app)
+        hint = f" (only installers found: {', '.join(skipped[:3])})" if skipped else ""
+        return {"ok": False, "error": f"no game executable found under {app['path']}{hint}"}
+
+    warnings = []
+    prefix = app["steamapps"] / "compatdata" / app["appid"] / "pfx"
+    if not prefix.exists():
+        warnings.append("fresh Proton prefix: first run creates it and installs "
+                        "redistributables; titles with a third-party launcher "
+                        "(Ubisoft Connect, EA App) usually need one launch from "
+                        "Steam before direct launching works")
+    if not steam_running():
+        warnings.append("the Steam client is not running: Steamworks games exit with "
+                        "'Failed to connect to Steam' — start Steam first")
     if not SHIM.exists():
         return {"ok": False, "error": f"tracer shim missing: build {SHIM.with_suffix('.c')}"}
 
@@ -224,14 +320,26 @@ def launch(game: str, exe: Path | None = None, timeout: float = 180.0,
         return {"ok": False, "error": f"spawn failed: {exc}"}
 
     result = {"ok": True, "app": app, "proton": str(proton), "exe": str(target),
-              "launcher_pid": child.pid, "pid": None, "trace": None,
+              "launcher_pid": child.pid, "pid": None, "trace": None, "warnings": warnings,
               "shim": str(SHIM), "env_keys": sorted(k for k in env if k.startswith(("STEAM_COMPAT", "CT_")) or k == "LD_PRELOAD")}
     if not wait:
         return result
 
-    pid = wait_for_game(game, child, timeout)
+    pid = wait_for_game(game, child, timeout, exe_hint=target)
     if pid is None:
-        result.update(ok=False, error="game process never appeared (check Proton log)")
+        # Nothing appeared: do not leave a hung Proton/wine tree behind (this is
+        # exactly how a failed Far Cry 5 launch ended up "still running borked").
+        cleaned = False
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=8)
+                cleaned = True
+            except Exception:
+                child.kill()
+                cleaned = True
+        result.update(ok=False, error="game process never appeared "
+                                     f"({'launcher process stopped' if cleaned else 'launcher already gone'})")
         return result
     ok, detail = trace_ok(pid)
     result.update(pid=pid, trace={"ok": ok, "detail": detail})

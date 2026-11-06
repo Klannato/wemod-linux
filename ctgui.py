@@ -458,6 +458,8 @@ class App:
 
     def _on_launch(self, res: dict) -> None:
         game = res.get("game", "?")
+        for warning in res.get("warnings") or []:
+            self.log(f"note: {warning}")
         if not res.get("ok"):
             self.log(f"launch failed: {res.get('error')}")
             dpg.set_value(self.status, "launch failed")
