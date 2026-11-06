@@ -387,9 +387,23 @@ class App:
 
     # ------------------------------------------------------------- attach
     def auto_attach(self) -> None:
+        """Find the running game and attach.
+
+        Cheat tables only name the exe when they contain an aobscanmodule (Far
+        Cry 5's is symbol-based), so fall back to the launched executable and to
+        the ProcessMonitor-free /proc scan in ctlaunch.
+        """
         pids: list[int] = []
         if self.current_game:
             pids = D.running_pids(self.current_game, self.procs)
+            if not pids:
+                app = L.find_app(self.current_game)
+                if app is not None:
+                    found = L.game_pid(L.find_exe(app, self.current_game), self.current_game)
+                    if found:
+                        self.log(f"found {self.current_game} by {found[1]} match (pid {found[0]})")
+                        self.attach(found[0])
+                        return
         if not pids:
             for g in list_games():
                 pids.extend(D.running_pids(g, self.procs))

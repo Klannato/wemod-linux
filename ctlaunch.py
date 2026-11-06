@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -652,7 +653,83 @@ def self_test() -> int:
     return 0 if ok else 1
 
 
-def launch_via_steam(game: str, timeout: float = 120.0, log=None) -> dict:
+def steam_command() -> list[str] | None:
+    """How to invoke Steam on this machine.
+
+    `steam` is not always on PATH — on this box the Debian install only provides
+    `~/.steam/steam/steam.sh`, so a bare subprocess of "steam" fails with
+    FileNotFoundError ("steam no exist"). Flatpak installs need `flatpak run`.
+    """
+    candidates = [
+        os.path.expanduser("~/.steam/steam/steam.sh"),
+        os.path.expanduser("~/.local/share/Steam/steam.sh"),
+        "/usr/bin/steam",
+        "/usr/games/steam",
+    ]
+    on_path = shutil.which("steam")
+    if on_path:
+        candidates.insert(0, on_path)
+    for cand in candidates:
+        path = Path(cand)
+        if path.is_file() and os.access(path, os.X_OK):
+            return [str(path)]
+    flatpak = shutil.which("flatpak")
+    if flatpak:
+        try:
+            info = subprocess.run([flatpak, "info", "com.valvesoftware.Steam"],
+                                  capture_output=True, timeout=10)
+            if info.returncode == 0:
+                return [flatpak, "run", "com.valvesoftware.Steam"]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def start_steam_client(timeout: float = 60.0, log=None) -> bool:
+    """Bring the Steam client up so -applaunch has somewhere to talk to."""
+    if steam_running():
+        return True
+    cmd = steam_command()
+    if cmd is None:
+        return False
+    if log:
+        log(f"starting the Steam client: {' '.join(cmd)} -silent")
+    try:
+        subprocess.Popen(cmd + ["-silent"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if steam_running():
+            if log:
+                log("  Steam client is up")
+            return True
+        time.sleep(2.0)
+    return False
+
+
+def fossilize_workers() -> int:
+    """Steam pre-caches Vulkan pipelines with `fossilize_replay` before launching.
+
+    While these are running the game process does not exist yet, so a "game did
+    not start" timeout during this phase means "still compiling shaders", not
+    "broken launch". Far Cry 5 can spend minutes here on a cold cache.
+    """
+    count = 0
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if comm.startswith("fossilize"):
+            count += 1
+    return count
+
+
+def launch_via_steam(game: str, timeout: float = 300.0, log=None) -> dict:
     """Start the game through the Steam client instead of Proton directly.
 
     Direct launches bypass Steam's runtime container, and titles that need it die
@@ -669,15 +746,24 @@ def launch_via_steam(game: str, timeout: float = 120.0, log=None) -> dict:
     if app is None:
         return {"ok": False, "error": f"'{game}' is not an installed Steam app"}
     exe = find_exe(app, game)
-    steam = "steam"
-    say(f"asking Steam to launch {game} (appid {app['appid']})")
+    cmd = steam_command()
+    if cmd is None:
+        return {"ok": False, "error": "no Steam launcher found (checked PATH, "
+                                      "~/.steam/steam/steam.sh, /usr/bin/steam, "
+                                      "/usr/games/steam, flatpak com.valvesoftware.Steam)"}
+    say(f"asking Steam to launch {game} (appid {app['appid']}) via {cmd[0]}")
+    if not start_steam_client(log=say):
+        return {"ok": False, "error": "the Steam client is not running and would not start"}
     try:
-        subprocess.Popen([steam, "-applaunch", app["appid"]],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(cmd + ["-applaunch", app["appid"]],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
     except OSError as exc:
-        return {"ok": False, "error": f"could not run steam: {exc}"}
+        return {"ok": False, "error": f"could not run {cmd[0]}: {exc}"}
 
     deadline = time.time() + timeout
+    started = time.time()
+    tick = 0
     while time.time() < deadline:
         found = game_pid(exe, game)
         if found:
@@ -691,9 +777,19 @@ def launch_via_steam(game: str, timeout: float = 120.0, log=None) -> dict:
                     "trace": {"ok": ok, "detail": detail},
                     "error": None if ok else f"attach refused ({detail}) — Steam launched "
                                             f"this game, so it has no tracer declaration"}
+        waited = time.time() - started
+        if int(waited) // 10 > tick:
+            tick = int(waited) // 10
+            workers = fossilize_workers()
+            phase = (f"Steam is still pre-caching Vulkan shaders ({workers} workers)"
+                     if workers else "waiting for the game process")
+            say(f"  {phase}… {waited:.0f}s")
         time.sleep(2.0)
+    workers = fossilize_workers()
+    hint = (" (shader pre-caching was still running — press Play again once it "
+            "finishes)" if workers else "")
     return {"ok": False, "app": app, "via": "steam",
-            "error": f"Steam did not start {game} within {timeout:.0f}s"}
+            "error": f"Steam did not start {game} within {timeout:.0f}s{hint}"}
 
 
 def main() -> None:
