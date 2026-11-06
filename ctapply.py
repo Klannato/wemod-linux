@@ -164,7 +164,7 @@ def _base_addr(addr_str: str | None, bases: dict[str, int]) -> int | None:
         if base is None:
             return None
         return base + sum(parse_int(x) for x in m.group(2).split("+"))
-    if re.fullmatch(r"[0-9A-Fa-f]+", s):  # absolute hex
+    if re.fullmatch(r"(?:0[xX])?[0-9A-Fa-f]+", s):  # absolute hex, with or without 0x
         return parse_int(s)
     return None  # symbol names / AOB entries — need live resolution
 

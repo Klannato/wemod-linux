@@ -2,10 +2,11 @@
 """
 ctgui — Dear PyGui front end for wemod-linux, styled Material Design (dark).
 
-Left: game list (filterable to installed / running, with auto-attach that finds
-the game's PID by its table's target executable). Right: that game's cheats
-(toggle AA scripts, edit value cheats). Bottom: a log pane and an agent chat
-that drives the free LLM (OpenRouter) -> scanmem.
+Left: game list (installed / running markers). Right: the game's **clean** cheat
+list — one row per cheat, a pill switch for anything that is a standing toggle,
+an Apply button for one-shot actions, and an inline value box for numbers. Rows
+come from ctclean.py's sidecar JSON, not from the raw table, so struct dumps
+(`RagdollScale` ×1373) never reach the UI.
 
 "Launch & attach" starts the game through Proton with the tracer shim loaded
 (see ctlaunch.py / native/ptrace_allow.c). That is what makes the process
@@ -26,40 +27,29 @@ sys.path.insert(0, str(Path(__file__).parent))
 import ctapply as C
 import ctaa as AA
 import ctagent as G
+import ctclean as CL
 import ctdetect as D
 import ctlaunch as L
 import cttheme as T
+import ctwidgets as W
 
 TABLES = D.TABLES
+CONF_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
-# ---------------------------------------------------------------- data helpers
 def list_games() -> list[str]:
     if not TABLES.exists():
         return []
     return sorted(d.name for d in TABLES.iterdir() if d.is_dir())
 
 
-def game_cheats(game: str) -> list[dict]:
-    """Flatten every cheat across a game's tables into rows."""
-    rows = []
-    for f in D.game_tables(game):
-        try:
-            entries = C.parse_ct(str(f))
-        except Exception:
-            continue
-        for path, e in C.flatten(entries):
-            is_script = "script" in e["type"].lower() or e["script"] is not None
-            rows.append({
-                "path": "  " * (len(path) - 1) + path[-1],
-                "address": e["address"] or "",
-                "offsets": e["offsets"],
-                "type": e["type"] or ("script" if is_script else ""),
-                "is_script": is_script,
-                "script": e["script"],
-                "entry": e,
-            })
-    return rows
+def value_size(vtype: str) -> int:
+    t = (vtype or "").lower()
+    if "byte" in t:
+        return 2 if t.startswith("2") else 1
+    if "8 byte" in t or "double" in t:
+        return 8
+    return 4
 
 
 class App:
@@ -67,21 +57,20 @@ class App:
         self.ui = ui or {}
         self.pid: int | None = None
         self.bases: dict[str, int] = {}
-        self.rows: list[dict] = []
-        self.cheat_labels: list[str] = []
-        self.enabled: dict[str, dict] = {}   # cheat index -> AA handle
-        self.edit_row: tuple | None = None
+        self.cheats: list[dict] = []
+        self.enabled: dict[str, dict] = {}     # state key -> AA handle
         self.q: queue.Queue = queue.Queue()
         self.log_lines: list[str] = []
         self.installed: set[str] = set()
         self.procs: dict[str, list[int]] = {}
         self.current_game: str | None = None
+        self.switches: dict[str, object] = {}
         self.launched: dict | None = None
+        self._suspend_select = False    # configure_item(items=...) fires the callback
 
     # ------------------------------------------------------------- widget tree
     def build(self) -> None:
         with dpg.window(tag="main", label="wemod-linux"):
-            # --- app bar: title, primary action, secondary actions, status chip
             with dpg.child_window(height=58, tag="appbar", no_scrollbar=True):
                 with dpg.group(horizontal=True):
                     dpg.add_text("wemod-linux", tag="app_title")
@@ -97,9 +86,9 @@ class App:
 
             dpg.add_spacer(height=8)
 
-            with dpg.child_window(height=430, tag="body"):
+            with dpg.child_window(height=470, width=-1, tag="body"):
                 with dpg.group(horizontal=True):
-                    with dpg.child_window(width=340, height=-1, tag="left_pane"):
+                    with dpg.child_window(width=320, height=-1, tag="left_pane"):
                         dpg.add_text("GAMES", tag="lbl_games")
                         dpg.add_input_text(tag="game_filter", hint="filter games",
                                            width=-1, callback=self.refresh_games)
@@ -108,25 +97,32 @@ class App:
                                              callback=self.refresh_games)
                             dpg.add_checkbox(label="Running", tag="running_only",
                                              callback=self.refresh_games)
-                        dpg.add_listbox([], tag="game_list", num_items=17, width=-1,
+                        dpg.add_listbox([], tag="game_list", num_items=18, width=-1,
                                         callback=self.on_select_game)
                     with dpg.child_window(width=-1, height=-1, tag="right_pane"):
-                        dpg.add_text("CHEATS", tag="lbl_cheats")
-                        dpg.add_listbox([], tag="cheat_list", num_items=17, width=-1)
                         with dpg.group(horizontal=True):
-                            dpg.add_button(label="Toggle (script)", tag="btn_toggle",
-                                           callback=self.toggle_cheat)
-                            dpg.add_button(label="Edit value", tag="btn_edit",
-                                           callback=self.edit_value)
+                            dpg.add_text("CHEATS", tag="lbl_cheats")
+                            dpg.add_spacer(width=10)
+                            self.cheat_count = dpg.add_text("", tag="cheat_count")
+                        dpg.add_input_text(tag="cheat_filter", hint="search cheats",
+                                           width=-1, callback=self.populate_cheats)
+                        with dpg.group(horizontal=True):
+                            dpg.add_checkbox(label="Values", tag="show_values",
+                                             default_value=True, callback=self.populate_cheats)
+                            dpg.add_checkbox(label="Show raw entries", tag="show_raw",
+                                             callback=self.populate_cheats)
+                        with dpg.child_window(height=-1, tag="cheat_scroll"):
+                            pass
 
             with dpg.collapsing_header(label="Log", default_open=True):
-                with dpg.child_window(height=140, tag="log_pane"):
+                with dpg.child_window(height=130, tag="log_pane"):
                     self.log_text = dpg.add_text(default_value="", wrap=0)
 
-            with dpg.collapsing_header(label="Agent", default_open=True):
+            with dpg.collapsing_header(label="Agent", default_open=False):
                 with dpg.group(horizontal=True):
-                    dpg.add_input_text(tag="agent_goal", hint="e.g. find the value 100 and set it to 9999",
-                                       width=-1, on_enter=True, callback=self.agent_send)
+                    dpg.add_input_text(tag="agent_goal", width=-1, on_enter=True,
+                                       hint="e.g. find the value 100 and set it to 9999",
+                                       callback=self.agent_send)
                     dpg.add_button(label="Send", tag="btn_send", callback=self.agent_send)
                 with dpg.child_window(height=150, tag="chat_pane"):
                     self.chat_text = dpg.add_text(default_value="", wrap=0)
@@ -134,7 +130,6 @@ class App:
         self._style()
 
     def _style(self) -> None:
-        """Apply Material surfaces and type scale to the items just built."""
         if not self.ui:
             return
         for item, level in (("appbar", 1), ("left_pane", 2), ("right_pane", 2),
@@ -142,23 +137,17 @@ class App:
             dpg.bind_item_theme(item, T.elevation(level))
         if self.ui.get("primary_button"):
             dpg.bind_item_theme("btn_launch", self.ui["primary_button"])
-        for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_toggle",
-                     "btn_edit", "btn_send"):
+        for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_send"):
             if self.ui.get("text_button"):
                 dpg.bind_item_theme(item, self.ui["text_button"])
-        fonts = {
-            "app_title": "headline",
-            "lbl_games": "caption",
-            "lbl_cheats": "caption",
-        }
-        for item, role in fonts.items():
+        for item, role in (("app_title", "headline"), ("lbl_games", "caption"),
+                           ("lbl_cheats", "caption"), ("cheat_count", "caption")):
             font = T.font_for(role)
             if font:
                 dpg.bind_item_font(item, font)
         self._chip("warn")
 
     def _chip(self, kind: str) -> None:
-        """Recolour the status text (ok / warn / error)."""
         theme = self.ui.get(kind)
         if theme:
             dpg.bind_item_theme("status", theme)
@@ -185,38 +174,220 @@ class App:
                 continue
             if q and q not in game.lower():
                 continue
-            prefix = ""
-            if pids:
-                prefix += "▶ "
-            elif is_inst:
-                prefix += "✓ "
+            prefix = "▶ " if pids else ("✓ " if is_inst else "")
             items.append(prefix + game)
-        dpg.configure_item("game_list", items=items)
+        self._suspend_select = True
+        try:
+            dpg.configure_item("game_list", items=items)
+        finally:
+            self._suspend_select = False
 
     def on_select_game(self, sender, app_data, user_data) -> None:
-        game = app_data
-        if not game:
+        if self._suspend_select or not app_data:
             return
-        self.current_game = game.lstrip("▶✓ ")
-        self.rows = game_cheats(self.current_game)
-        self.cheat_labels = [r["path"] for r in self.rows]
-        dpg.configure_item("cheat_list", items=self.cheat_labels)
-        self.log(f"loaded {len(self.rows)} cheats for {self.current_game}")
+        game = app_data.lstrip("▶✓ ")
+        if game == self.current_game:
+            return
+        self.current_game = game
+        self.cheats = CL.load_clean(game)["cheats"]
+        self.enabled.clear()
+        self.log(f"{game}: {len(self.cheats)} cleaned cheats")
+        self.populate_cheats()
+
+    # ------------------------------------------------------------- cheat list
+    def _visible_cheats(self) -> list[dict]:
+        q = (dpg.get_value("cheat_filter") or "").strip().lower()
+        show_raw = dpg.get_value("show_raw")
+        show_values = dpg.get_value("show_values")
+        out = []
+        for c in self.cheats:
+            if not show_raw and c["confidence"] == "low":
+                continue
+            if not show_values and not c.get("toggle") and not c.get("one_shot"):
+                continue
+            if q and q not in c["description"].lower() and q not in c["category"].lower():
+                continue
+            out.append(c)
+        return out
+
+    def populate_cheats(self, *_) -> None:
+        """(Re)build the grouped cheat rows inside the scrolling pane."""
+        W.clear()
+        self.switches.clear()
+        if dpg.does_item_exist("cheat_scroll"):
+            dpg.delete_item("cheat_scroll", children_only=True)
+        if not self.current_game:
+            dpg.set_value(self.cheat_count, "")
+            return
+
+        cheats = self._visible_cheats()
+        dpg.set_value(self.cheat_count, f"{len(cheats)} of {len(self.cheats)}")
+        if not cheats:
+            dpg.add_text("nothing matches — clear the filter or tick Show raw entries",
+                         parent="cheat_scroll")
+            return
+
+        groups: dict[str, list[dict]] = {}
+        for c in cheats:
+            groups.setdefault(c["category"] or "General", []).append(c)
+
+        # Items are added into an existing container: push it rather than passing
+        # parent= to every widget, because a collapsing_header only becomes a
+        # usable container while it is on the container stack.
+        dpg.push_container_stack("cheat_scroll")
+        try:
+            for category in sorted(groups, key=lambda k: (-len(groups[k]), k.lower())):
+                rows = sorted(groups[category],
+                              key=lambda c: (CONF_ORDER[c["confidence"]],
+                                             c["description"].lower()))
+                try:
+                    with dpg.collapsing_header(label=f"{category}  ({len(rows)})",
+                                               default_open=True):
+                        with dpg.table(header_row=False, policy=dpg.mvTable_SizingStretchProp,
+                                       borders_innerH=False, borders_outerH=False,
+                                       borders_innerV=False, borders_outerV=False):
+                            dpg.add_table_column(width_stretch=True)
+                            dpg.add_table_column(init_width_or_weight=64, width_fixed=True)
+                            for c in rows:
+                                self._cheat_row(c)
+                except Exception as exc:      # one bad row must not blank the list
+                    print(f"row build failed ({category}): {exc!r}", file=sys.stderr)
+        finally:
+            try:
+                dpg.pop_container_stack()
+            except Exception:
+                pass
+
+    def _cheat_row(self, c: dict) -> None:
+        key = f"{c['category']}/{c['description']}"
+        with dpg.table_row():
+            label = c["description"] + ("   (raw)" if c["confidence"] == "low" else "")
+            dpg.add_text(label)
+            cell = dpg.generate_uuid()
+            with dpg.group(horizontal=True, tag=cell):
+                if c.get("toggle") and c["kind"] == "script":
+                    sw = W.add_switch(cell, value=key in self.enabled,
+                                      on_change=lambda v, c=c, k=key: self._on_script_toggle(c, k, v))
+                    self.switches[key] = sw
+                elif c.get("one_shot"):
+                    dpg.add_button(label="Apply", callback=self._apply_once, user_data=c)
+                elif c["kind"] == "value" and c.get("toggle"):
+                    sw = W.add_switch(cell, value=False,
+                                      on_change=lambda v, c=c, k=key: self._on_value_toggle(c, k, v))
+                    self.switches[key] = sw
+                elif c["kind"] == "value":
+                    input_tag = f"val_{abs(hash(key))}"
+                    dpg.add_input_text(tag=input_tag, width=70, decimal=True, hint=c["type"])
+                    dpg.add_button(label="Set", width=42, callback=self._on_set_value,
+                                   user_data=(c, input_tag))
+                else:
+                    dpg.add_text(c["type"] or "—", color=(120, 120, 120))
+
+    # ------------------------------------------------------------- actions
+    def _address_of(self, c: dict) -> int | None:
+        if self.pid is None:
+            return None
+        addr = c.get("address") or (c.get("addresses") or [None])[0]
+        if not addr:
+            return None
+        entry = {"address": addr, "offsets": c.get("offsets") or []}
+        try:
+            return C.resolve(self.pid, entry, self.bases)
+        except Exception:
+            return C._base_addr(addr, self.bases)
+
+    def _on_script_toggle(self, c: dict, key: str, value: bool) -> None:
+        sw = self.switches.get(key)
+        if self.pid is None:
+            self.log("attach to the game first")
+            if sw:
+                sw.set(False)
+            return
+        if not value:
+            handle = self.enabled.pop(key, None)
+            if handle:
+                try:
+                    AA.aa_disable(self.pid, handle)
+                    self.log(f"disabled: {c['description']}")
+                except Exception as exc:
+                    self.log(f"disable failed: {exc}")
+            return
+        self.log(f"enabling {c['description']} (AOB scan + inject)…")
+        threading.Thread(target=self._enable_worker, args=(c, key), daemon=True).start()
+
+    def _enable_worker(self, c: dict, key: str) -> None:
+        try:
+            handle = AA.auto_enable(self.pid, c["script"])
+            self.q.put(("aa_ok", (key, handle, c["description"])))
+        except Exception as exc:
+            self.q.put(("aa_err", (key, c["description"], str(exc))))
+
+    def _on_value_toggle(self, c: dict, key: str, value: bool) -> None:
+        sw = self.switches.get(key)
+        addr = self._address_of(c)
+        if addr is None:
+            self.log(f"{c['description']}: address unavailable "
+                     f"(symbol '{c.get('address')}' needs the table's own script)")
+            if sw:
+                sw.set(False)
+            return
+        try:
+            C.write_value(self.pid, addr, 1 if value else 0, value_size(c["type"]))
+            self.log(f"{c['description']} -> {1 if value else 0}")
+        except Exception as exc:
+            self.log(f"write failed: {exc}")
+            if sw:
+                sw.set(not value)
+
+    def _on_set_value(self, sender=None, app_data=None, user_data=None) -> None:
+        c, input_tag = user_data
+        addr = self._address_of(c)
+        if addr is None:
+            self.log(f"{c['description']}: address unavailable")
+            return
+        try:
+            val = int(float(dpg.get_value(input_tag)))
+        except (TypeError, ValueError):
+            self.log(f"{c['description']}: not a number")
+            return
+        try:
+            C.write_value(self.pid, addr, val, value_size(c["type"]))
+            self.log(f"{c['description']} -> {val}")
+        except Exception as exc:
+            self.log(f"write failed: {exc}")
+
+    def _apply_once(self, sender=None, app_data=None, user_data=None) -> None:
+        c = user_data
+        if self.pid is None:
+            self.log("attach to the game first")
+            return
+        if c["kind"] == "script" and c.get("script"):
+            self.log(f"applying {c['description']}…")
+            threading.Thread(target=self._apply_worker, args=(c,), daemon=True).start()
+        else:
+            self._on_value_toggle(c, "", True)
+
+    def _apply_worker(self, c: dict) -> None:
+        try:
+            AA.auto_enable(self.pid, c["script"])
+            self.q.put(("chat", f"applied: {c['description']}"))
+        except Exception as exc:
+            self.q.put(("chat", f"apply failed ({c['description']}): {exc}"))
 
     # ------------------------------------------------------------- attach
     def auto_attach(self) -> None:
         pids: list[int] = []
         if self.current_game:
             pids = D.running_pids(self.current_game, self.procs)
-        if not pids:  # fall back to any running game in the library
+        if not pids:
             for g in list_games():
                 pids.extend(D.running_pids(g, self.procs))
                 if pids:
                     self.current_game = g
                     break
         if not pids:
-            self.log("no running game found — press Launch & attach (a game started "
-                     "from Steam cannot be traced on this kernel)")
+            self.log("no running game found — press Launch & attach "
+                     "(a game started from Steam cannot be traced on this kernel)")
             return
         self.attach(pids[0])
 
@@ -237,17 +408,19 @@ class App:
             self.log(f"attached to pid {pid} but memory access is denied ({detail}). "
                      f"Launch the game with Launch & attach so it declares this "
                      f"trainer as its tracer.")
+        self.populate_cheats()
 
     def detach(self) -> None:
         self.pid = None
         self.bases = {}
+        self.enabled.clear()
         dpg.set_value(self.status, "not attached")
         self._chip("warn")
         self.log("detached")
+        self.populate_cheats()
 
     # ------------------------------------------------------------- launch
     def launch_and_attach(self) -> None:
-        """Start the selected game under Proton with the tracer shim, then attach."""
         game = self.current_game
         if not game:
             label = dpg.get_value("game_list")
@@ -256,8 +429,7 @@ class App:
         if not game:
             self.log("select a game first")
             return
-        app = L.find_app(game)
-        if app is None:
+        if L.find_app(game) is None:
             self.log(f"'{game}' is not installed through Steam — cannot launch it")
             return
         proton = L.find_proton()
@@ -274,8 +446,7 @@ class App:
         try:
             res = L.launch(game, wait=True, timeout=240.0)
         except Exception as exc:
-            self.q.put(("launch", {"ok": False, "error": repr(exc), "game": game}))
-            return
+            res = {"ok": False, "error": repr(exc)}
         res["game"] = game
         self.q.put(("launch", res))
 
@@ -290,108 +461,10 @@ class App:
         pid = res.get("pid")
         trace = (res.get("trace") or {}).get("detail", "?")
         self.log(f"{game} is running (pid {pid}); tracer access {trace}")
-        self.current_game = game
+        if game != self.current_game:
+            self.current_game = game
+            self.cheats = CL.load_clean(game)["cheats"]
         self.attach(int(pid))
-
-    # ------------------------------------------------------------- cheats
-    def _selected_index(self) -> int | None:
-        label = dpg.get_value("cheat_list")
-        if not label:
-            return None
-        try:
-            return self.cheat_labels.index(label)
-        except ValueError:
-            return None
-
-    def toggle_cheat(self) -> None:
-        i = self._selected_index()
-        if i is None:
-            self.log("select a cheat first")
-            return
-        r = self.rows[i]
-        if not r["is_script"]:
-            self.log(f"'{r['path']}' is a value cheat — use Edit value")
-            return
-        if self.pid is None:
-            self.log("attach to a running game first")
-            return
-        key = str(i)
-        if key in self.enabled:
-            try:
-                AA.aa_disable(self.pid, self.enabled.pop(key))
-                self.log(f"disabled script: {r['path']}")
-            except Exception as exc:
-                self.log(f"disable failed: {exc}")
-            return
-        if not r["script"]:
-            self.log("no AA script body")
-            return
-        self.log(f"enabling script (AOB scan + inject): {r['path']}")
-        threading.Thread(target=self._aa_worker, args=(key, r["script"], r["path"]), daemon=True).start()
-
-    def _aa_worker(self, key: str, script: str, name: str) -> None:
-        try:
-            h = AA.auto_enable(self.pid, script)
-            self.q.put(("aa_ok", (key, h, name)))
-        except Exception as exc:
-            self.q.put(("aa_err", (key, name, str(exc))))
-
-    def edit_value(self) -> None:
-        i = self._selected_index()
-        if i is None:
-            self.log("select a value cheat first")
-            return
-        r = self.rows[i]
-        if r["is_script"] or not r["address"]:
-            self.log("not a value cheat")
-            return
-        if self.pid is None:
-            self.log("attach to a running game first")
-            return
-        addr = C._base_addr(r["address"], self.bases)
-        if addr is None:
-            self.log("could not resolve address")
-            return
-        if r["offsets"]:
-            addr = C.resolve(self.pid, r["entry"], self.bases)
-            if addr is None:
-                self.log("pointer path failed to resolve")
-                return
-        size = 8 if "double" in r["type"].lower() else 4 if "float" in r["type"].lower() or "4 byte" in r["type"].lower() else 8
-        try:
-            cur = C.read_value(self.pid, addr, size)
-        except Exception as exc:
-            self.log(f"read failed: {exc}")
-            return
-        self.edit_row = (addr, size)
-        if dpg.does_item_exist("edit_modal"):
-            dpg.delete_item("edit_modal")
-        with dpg.window(label=f"Edit value — {r['path']}", modal=True, width=360,
-                        height=150, tag="edit_modal", pos=(420, 240)):
-            dpg.add_text(default_value=f"address {addr:#x}, current {cur}")
-            dpg.add_input_text(tag="edit_input", default_value=str(cur), width=-1)
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Write", tag="btn_write", callback=self.write_value)
-                dpg.add_button(label="Cancel", tag="btn_cancel",
-                               callback=lambda: dpg.delete_item("edit_modal"))
-        if self.ui.get("primary_button"):
-            dpg.bind_item_theme("btn_write", self.ui["primary_button"])
-        if self.ui.get("text_button"):
-            dpg.bind_item_theme("btn_cancel", self.ui["text_button"])
-
-    def write_value(self) -> None:
-        try:
-            val = int(dpg.get_value("edit_input"), 0)
-        except ValueError:
-            self.log("invalid value")
-            return
-        addr, size = self.edit_row
-        try:
-            C.write_value(self.pid, addr, val, size)
-            self.log(f"wrote {val} to {addr:#x}")
-        except Exception as exc:
-            self.log(f"write failed: {exc}")
-        dpg.delete_item("edit_modal")
 
     # ------------------------------------------------------------- agent
     def agent_send(self, *_) -> None:
@@ -423,14 +496,18 @@ class App:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == "chat":
-                    dpg.set_value(self.chat_text, dpg.get_value(self.chat_text) + "\n" + payload + "\n")
+                    dpg.set_value(self.chat_text,
+                                  dpg.get_value(self.chat_text) + "\n" + payload + "\n")
                 elif kind == "aa_ok":
-                    key, h, name = payload
-                    self.enabled[key] = h
-                    self.log(f"script enabled: {name} (cave {h['cave']:#x})")
+                    key, handle, name = payload
+                    self.enabled[key] = handle
+                    self.log(f"enabled: {name} (cave {handle['cave']:#x})")
                 elif kind == "aa_err":
                     key, name, err = payload
-                    self.log(f"script enable failed ({name}): {err}")
+                    self.log(f"enable failed ({name}): {err}")
+                    sw = self.switches.get(key)
+                    if sw:
+                        sw.set(False)
                 elif kind == "launch":
                     self._on_launch(payload)
         except queue.Empty:
@@ -443,7 +520,7 @@ def main() -> None:
     ui = T.apply()                      # Material theme + type scale, bound globally
     app = App(ui)
     app.build()
-    dpg.create_viewport(title="wemod-linux", width=1250, height=860)
+    dpg.create_viewport(title="wemod-linux", width=1250, height=900)
     dpg.setup_dearpygui()
     dpg.show_viewport()
     dpg.set_primary_window("main", True)

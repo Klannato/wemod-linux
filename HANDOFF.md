@@ -3,6 +3,28 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-05 (later)
+**Clean list + WeMod-style rows are in.** `ctclean.py` builds sidecars for all 169
+games with tables: 16,119 rows out of 57,849 raw entries (2,075 `high` script
+cheats, 5,612 `medium`, 8,432 `low` struct junk). The GUI's cheat pane is now
+grouped rows with a pill switch per standing cheat, an Apply button for one-shot
+actions ("Refill …"), and an inline value box for numbers — no listbox, no
+select-then-press-a-button dance.
+
+Two defects found and fixed on the way:
+- **CJK was tofu, not mojibake.** Far Cry 5's table is valid UTF-8 Chinese
+  (`不被探测`, `弹匣不减`); the boxes were the Latin-only Roboto face. The UI now
+  loads Noto Sans CJK and DPG 2.x builds the ranges automatically
+  (`add_font_range_hint` is a deprecated no-op).
+- **`ctclean` must recognise CJK keywords**, or every row in the Ubisoft tables
+  scores as junk. Script presence carries most rows there anyway.
+
+Verified: `tests/test_toggle.py` drives the same handler the switch calls and
+confirms a 1/0 write into a live process plus a refusal for an unresolvable
+symbol; `tests/test_gui_render.py "Far Cry 5"` renders the CJK rows and switches.
+Still open: value rows whose address is an AA symbol cannot resolve (the 88%
+problem below) — their switches log the reason and stay off.
+
 ## Status — 2026-11-05
 **Option 1 (trainer launches the game) is built and verified.** Files: `ctlaunch.py`,
 `native/ptrace_allow.c` (+ built `native/ptrace_allow.so`), `cttheme.py`,

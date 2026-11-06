@@ -61,11 +61,25 @@ TYPE_SCALE = {          # Material type scale -> Dear PyGui point sizes
 
 
 def _font_file() -> Path | None:
-    for cand in (ASSETS / "Roboto-Regular.ttf",
+    """Family for the whole UI.
+
+    Noto Sans CJK comes first on purpose: cheat tables are frequently Chinese
+    (the Far Cry / Ubisoft ones are Chinese-only), and a Latin-only face renders
+    every one of those names as boxes. Noto's Latin is metrically close to
+    Roboto, so the Material look survives.
+    """
+    for cand in (ASSETS / "NotoSansCJK-Regular.ttc",
+                 Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+                 ASSETS / "Roboto-Regular.ttf",
                  Path("/usr/share/fonts/truetype/open-sans/OpenSans-Regular.ttf")):
         if cand.is_file():
             return cand
     return None
+
+
+_CJK_HINTS = ("mvFontRangeHint_Chinese_Simplified_Common",
+              "mvFontRangeHint_Chinese_Traditional_Common",
+              "mvFontRangeHint_Japanese")
 
 
 _fonts: dict[int, int] | None = None
@@ -89,6 +103,8 @@ def load_fonts() -> dict[int, int]:
         tag = dpg.generate_uuid()
         with dpg.font_registry(tag=tag):
             for size in sorted(set(TYPE_SCALE.values())):
+                # Dear PyGui 2.x builds the glyph ranges automatically; the old
+                # add_font_range_hint() calls are no-ops now.
                 fonts[size] = dpg.add_font(str(path), size)
     except Exception:
         _fonts = {}

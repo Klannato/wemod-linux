@@ -20,15 +20,18 @@ from ctgui import App
 
 def main() -> int:
     frames = int(sys.argv[1]) if len(sys.argv) > 1 else 240
+    preselect = sys.argv[2] if len(sys.argv) > 2 else None
     dpg.create_context()
     ui = T.apply()
     app = App(ui)
     app.build()
-    dpg.create_viewport(title="wemod-linux", width=1250, height=860)
+    dpg.create_viewport(title="wemod-linux", width=1250, height=900)
     dpg.setup_dearpygui()
     dpg.show_viewport()
     dpg.set_primary_window("main", True)
     app.refresh()
+    if preselect:
+        app.on_select_game(None, preselect, None)
     dpg.set_frame_callback(1, app._poll)
 
     n = 0

@@ -48,7 +48,9 @@ Python 3, no daemons, no root (except one `sysctl` for ptrace — see below).
 | `ctinject.py` | ptrace injection primitives + keystone + remote `mmap` code caves |
 | `ctagent.py` | OpenRouter free-model agent (`scan` / `translate`) |
 | `ctdetect.py` | Running/installed-game detection (PID finder + Steam library) |
+| `ctclean.py` | Normalizes `.ct` tables into a clean per-game cheat list (JSON sidecar) |
 | `ctlaunch.py` | Launches a Steam game under Proton with the tracer shim loaded |
+| `ctwidgets.py` | Custom controls (the pill switch Dear PyGui lacks) |
 | `cttheme.py` | Material Design (dark) theme + type scale for the GUI |
 | `native/ptrace_allow.c` | `LD_PRELOAD` shim: lets the trainer trace a game it launched |
 | `ctgui.py` | Dear PyGui front end (games, cheats, log, agent chat) |
@@ -100,6 +102,18 @@ python3 ctfetch.py search "no man's sky"
 python3 ctapply.py list ~/.local/share/ctfetch/tables/"No Man's Sky"/some.CT
 python3 ctapply.py modules <PID>                           # list module bases
 ```
+
+Clean the tables once (169 sidecars, ~16k rows out of 57k raw entries):
+
+```bash
+python3 ctclean.py                # every game -> ~/.local/share/ctfetch/clean/<Game>.json
+python3 ctclean.py --game "Far Cry 5"
+python3 ctclean.py --stats
+```
+
+Each cheat gets a confidence: `high` (has an Auto Assembler script), `medium`
+(cheat-like name, English or CJK), `low` (struct field). The GUI shows high and
+medium; `Show raw entries` reveals the rest. Originals are never modified.
 
 GUI flow: pick a game → **Launch & attach** (starts it through Proton with the
 tracer shim, waits for the process, verifies memory access, attaches) → toggle a
@@ -167,8 +181,11 @@ python3 tests/test_wine_preload.py
 # Material theme + font loading, headless (no viewport)
 python3 tests/test_theme.py
 
-# GUI renders N frames then exits (needs a display)
-python3 tests/test_gui_render.py 120
+# GUI renders N frames then exits (needs a display); optional 2nd arg = preselect a game
+python3 tests/test_gui_render.py 120 "Far Cry 5"
+
+# toggle path: writes 1/0 into a live child process and refuses bad addresses
+python3 tests/test_toggle.py
 
 # scan target for the injection layer
 gcc -no-pie -O0 -fcf-protection=none -z execstack -o test_inject test_inject.c
