@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ctgui — Dear PyGui front end for wemod-linux, styled Material Design (dark).
+ctgui — WeCheat: the Dear PyGui front end (Material Design, dark).
 
 Left: game list (installed / running markers). Right: the game's **clean** cheat
 list — one row per cheat, a pill switch for anything that is a standing toggle,
@@ -78,10 +78,10 @@ class App:
 
     # ------------------------------------------------------------- widget tree
     def build(self) -> None:
-        with dpg.window(tag="main", label="wemod-linux"):
+        with dpg.window(tag="main", label="WeCheat"):
             with dpg.child_window(height=58, tag="appbar", no_scrollbar=True):
                 with dpg.group(horizontal=True):
-                    dpg.add_text("wemod-linux", tag="app_title")
+                    dpg.add_text("WeCheat", tag="app_title")
                     dpg.add_spacer(width=16)
                     dpg.add_button(label="Launch & attach", tag="btn_launch",
                                    callback=self.launch_and_attach)
@@ -542,7 +542,8 @@ class App:
         summary = (f"{best['matched']}/{best['checked']} asserts match this build"
                    if best["checked"] else "no direct-address asserts")
         dpg.set_value("compat_text", summary)
-        self.log(f"{game}: {best['table']} — {summary} ({best['verdict']})")
+        detail = "" if best["verdict"] == summary else f" ({best['verdict']})"
+        self.log(f"{game}: {best['table']} — {summary}{detail}")
         if best.get("drifts"):
             self.log(f"  observed drifts: {', '.join(best['drifts'][:6])}"
                      + ("  (inconsistent — remapping cannot be trusted)"
@@ -944,7 +945,7 @@ def main() -> None:
     ui = T.apply()                      # Material theme + type scale, bound globally
     app = App(ui)
     app.build()
-    dpg.create_viewport(title="wemod-linux", width=1250, height=900)
+    dpg.create_viewport(title="WeCheat", width=1250, height=900)
     dpg.setup_dearpygui()
     dpg.show_viewport()
     dpg.set_primary_window("main", True)

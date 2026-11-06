@@ -136,7 +136,8 @@ def score_table(path: Path, module_roots: list[Path]) -> dict:
     asserts = table_asserts(path)
     if not asserts:
         return {"table": path.name, "asserts": 0, "checked": 0, "matched": 0,
-                "verdict": "no direct-address asserts"}
+                "verdict": "AOB-based / no fixed addresses (build-independent)",
+                "remap_safe": True, "samples": []}
     by_module: dict[str, list[dict]] = {}
     for a in asserts:
         by_module.setdefault(a["module"], []).append(a)
