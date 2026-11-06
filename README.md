@@ -128,6 +128,21 @@ GUI flow: pick a game → **Launch & attach** (starts it through Proton with the
 tracer shim, waits for the process, verifies memory access, attaches) → toggle a
 script cheat or edit a value → or ask the agent "find 100 and set it to 9999".
 
+For titles that only work under Steam's runtime (Far Cry 5 dies with
+`X Error … BadAlloc (GLX)` when started through Proton directly), put this in the
+game's **Launch Options** (Steam → right-click → Properties → Launch Options) and
+then start the game normally from Steam:
+
+```
+LD_PRELOAD=/home/geo/wemod-linux/native/ptrace_allow.so CT_TRACER_PID_FILE=/home/geo/.cache/ct_tracer.pid %command%
+```
+
+The shim reads the trainer's pid from that file (Steam can't substitute a live pid
+at launch time), so the Steam-launched game declares the trainer as its tracer —
+no sudo, no `setcap`, `ptrace_scope` stays at 1. `ctlaunch.steam_launch_options()`
+prints the current string, and the GUI shows it in the log whenever an attach is
+refused.
+
 **Launch via Steam** asks the Steam client to start the game. Use it for titles
 that need Steam's runtime container — running Proton directly makes them die with
 `X Error … BadAlloc (GLX)`, which Far Cry 5 does. The catch: Steam's child has no

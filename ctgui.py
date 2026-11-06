@@ -413,9 +413,12 @@ class App:
             self.log(f"attached to pid {pid} — memory access {detail}")
         else:
             self._chip("error")
-            self.log(f"attached to pid {pid} but memory access is denied ({detail}). "
-                     f"Launch the game with Launch & attach so it declares this "
-                     f"trainer as its tracer.")
+            self.log(f"attached to pid {pid} but memory access is denied ({detail}).")
+            self.log("  fix: launch the game from Steam with these Launch Options "
+                     "(right-click game → Properties → Launch Options):")
+            self.log(f"  {L.steam_launch_options()}")
+            self.log("  the shim then reads this trainer's pid from "
+                     f"{L.TRACER_PID_FILE}; no sudo, no ptrace_scope change.")
         self.populate_cheats()
 
     def detach(self) -> None:
@@ -564,6 +567,7 @@ class App:
 
 
 def main() -> None:
+    L.write_tracer_pid()        # for shims loaded into Steam-launched games
     dpg.create_context()
     ui = T.apply()                      # Material theme + type scale, bound globally
     app = App(ui)

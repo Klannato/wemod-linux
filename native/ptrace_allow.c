@@ -38,6 +38,22 @@
 
 static long ct_tracer = -1;
 
+/* The tracer pid can also arrive through a file, because Steam launch options
+ * cannot know a pid at config time: `CT_TRACER_PID_FILE=~/.cache/ct_tracer.pid`
+ * with `LD_PRELOAD=…/ptrace_allow.so` in the game's launch options is enough for
+ * a Steam-launched game to declare the trainer as its tracer — no root, no
+ * capability, and Steam's runtime container stays intact. */
+static long ct_pid_from_file(void) {
+    const char *path = getenv("CT_TRACER_PID_FILE");
+    if (!path || !*path) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    long pid = -1;
+    if (fscanf(f, "%ld", &pid) != 1) pid = -1;
+    fclose(f);
+    return pid;
+}
+
 static void ct_trace_log(const char *msg, long pid, int rc) {
     if (!getenv("CT_TRACE_DEBUG")) return;
     fprintf(stderr, "ptrace_allow[%d]: %s pid=%ld rc=%d\n", (int)getpid(), msg, pid, rc);
@@ -67,6 +83,8 @@ static void ct_apply_child(void) { ct_apply(0); }   /* fork child: syscalls only
 static void *ct_watchdog(void *arg) {
     (void)arg;
     for (;;) {
+        long from_file = ct_pid_from_file();
+        if (from_file > 0) ct_tracer = from_file;
         ct_apply(1);
         sleep(1);
     }
@@ -76,7 +94,17 @@ static void *ct_watchdog(void *arg) {
 __attribute__((constructor))
 static void ct_init(void) {
     const char *s = getenv("CT_TRACER_PID");
-    if (!s || !*s) return;
+    if (!s || !*s) {
+        long from_file = ct_pid_from_file();
+        if (from_file <= 0) return;
+        ct_tracer = from_file;
+        ct_apply(1);
+        pthread_atfork(NULL, NULL, ct_apply_child);
+        pthread_t th;
+        if (pthread_create(&th, NULL, ct_watchdog, NULL) == 0)
+            pthread_detach(th);
+        return;
+    }
     char *end = NULL;
     long pid = strtol(s, &end, 10);
     if (end == s || pid <= 0) {

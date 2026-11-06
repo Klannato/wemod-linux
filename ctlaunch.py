@@ -34,6 +34,21 @@ import ctdetect as D
 
 HERE = Path(__file__).resolve().parent
 SHIM = HERE / "native" / "ptrace_allow.so"
+# The shim can learn the tracer pid from this file, which is what makes the
+# Steam-launch-options route work: Steam cannot substitute a pid at launch time.
+TRACER_PID_FILE = Path.home() / ".cache" / "ct_tracer.pid"
+
+
+def write_tracer_pid(pid: int | None = None) -> Path:
+    """Publish our pid for shims loaded into processes we did not spawn."""
+    TRACER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TRACER_PID_FILE.write_text(str(pid or os.getpid()))
+    return TRACER_PID_FILE
+
+
+def steam_launch_options() -> str:
+    """The string to paste into a Steam game's Launch Options (no root needed)."""
+    return (f"LD_PRELOAD={SHIM} CT_TRACER_PID_FILE={TRACER_PID_FILE} %command%")
 
 
 # ---------------------------------------------------------------- Steam layout

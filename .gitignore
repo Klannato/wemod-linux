@@ -7,6 +7,7 @@ test_inject
 
 # Built native shims (gcc -shared — see README)
 native/*.so
+native/ctptrace
 native/*.o
 native/.selftest.pid
 

@@ -3,6 +3,32 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-05 (late): ptrace permission settled without root
+Tried the "narrow setcap'd helper" (`native/ctptrace.c`): **it cannot work**.
+`PR_CAP_AMBIENT_RAISE` needs the cap in the process *inheritable* set, which only
+root/CAP_SETPCAP can populate; a file capability (`+eip`) fills permitted+effective
+and the exec'd child comes back unprivileged. Verified: `getcap` showed
+`cap_sys_ptrace=eip` and the raise still failed with EPERM.
+
+What works instead, with no privilege at all — put this in the game's Steam Launch
+Options so a *Steam-launched* process loads the shim (correct runtime container,
+correct seat):
+
+```
+LD_PRELOAD=/home/geo/wemod-linux/native/ptrace_allow.so CT_TRACER_PID_FILE=/home/geo/.cache/ct_tracer.pid %command%
+```
+
+The shim now reads the tracer pid from `~/.cache/ct_tracer.pid` (written by the
+trainer on startup; the watchdog re-reads it every second) because Steam cannot
+substitute a live pid. Verified with a real wine process: with `CT_TRACER_PID`
+unset and only the file present, `process_vm_readv` succeeded on the wine PE
+process. This also removes the 32-bit-shim problem for the *launcher* stub: the
+real game process loads the shim, so the stub's `wrong ELF class` warning is moot.
+
+Remaining privileged fallbacks, in order of least damage: `setcap cap_sys_ptrace+ep`
+on the interpreter that runs the trainer (privileges every script under it), then
+`sysctl kernel.yama.ptrace_scope=0` (machine-wide).
+
 ## Status — 2026-11-05 (night)
 **Launch debugging added, and the Far Cry 5 blocker identified.** Every launch now
 logs the plan (game/appid/install/proton/exe size), the exact command, cwd, the
