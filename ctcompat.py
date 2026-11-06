@@ -244,7 +244,7 @@ def main() -> None:
         print(f"  {t['table'][:50]:50} {t['matched']}/{t['checked']} asserts  "
               f"{t['verdict']}" + (f"  drift {t['consistent_drift']}"
                                    if t.get("consistent_drift") else ""))
-        for s in t["samples"][:3]:
+        for s in (t.get("samples") or [])[:3]:
             print(f"      {s}")
     if res["best"]:
         b = res["best"]
