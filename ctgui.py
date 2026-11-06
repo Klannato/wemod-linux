@@ -30,6 +30,7 @@ import ctaa as AA
 import ctagent as G
 import ctclean as CL
 import ctdetect as D
+import ctfind as F
 import ctlaunch as L
 import cttheme as T
 import ctwidgets as W
@@ -68,6 +69,8 @@ class App:
         self.current_game: str | None = None
         self.switches: dict[str, object] = {}
         self.launched: dict | None = None
+        self.find_hits: list[int] = []
+        self.find_patch: dict | None = None
         self._suspend_select = False    # configure_item(items=...) fires the callback
 
     # ------------------------------------------------------------- widget tree
@@ -125,6 +128,31 @@ class App:
             with dpg.collapsing_header(label="Log", default_open=True):
                 with dpg.child_window(height=130, tag="log_pane"):
                     self.log_text = dpg.add_text(default_value="", wrap=0)
+
+            with dpg.collapsing_header(label="Find cheat", default_open=False, tag="find_header"):
+                with dpg.child_window(height=190, tag="find_pane"):
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Type")
+                        dpg.add_combo(["int32", "int64", "float", "double", "byte"],
+                                      tag="find_kind", width=90, default_value="int32")
+                        dpg.add_text("Value in game")
+                        dpg.add_input_text(tag="find_value", width=110, decimal=True)
+                        dpg.add_button(label="Scan", tag="btn_scan", callback=self.find_scan)
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("After changing it in game, new value")
+                        dpg.add_input_text(tag="find_new", width=110, decimal=True)
+                        dpg.add_button(label="Refine", tag="btn_refine", callback=self.find_refine)
+                        dpg.add_button(label="Watch writes", tag="btn_watch", callback=self.find_watch)
+                    dpg.add_text("", tag="find_status")
+                    with dpg.group(horizontal=True):
+                        dpg.add_listbox([], tag="find_list", num_items=4, width=260)
+                        with dpg.group():
+                            dpg.add_text("", tag="find_writer", wrap=320)
+                            with dpg.group(horizontal=True):
+                                dpg.add_button(label="Apply patch", tag="btn_apply_patch",
+                                               callback=self.find_apply)
+                                dpg.add_button(label="Undo", tag="btn_undo_patch",
+                                               callback=self.find_undo)
 
             with dpg.collapsing_header(label="Agent", default_open=False):
                 with dpg.group(horizontal=True):
@@ -414,6 +442,107 @@ class App:
         except Exception as exc:
             self.q.put(("chat", f"apply failed ({c['description']}): {exc}"))
 
+    # ------------------------------------------------------------- find cheat
+    def _find_value(self, tag: str):
+        kind = dpg.get_value("find_kind")
+        raw = (dpg.get_value(tag) or "").strip()
+        if not raw:
+            return None
+        try:
+            return float(raw) if kind in ("float", "double") else int(float(raw))
+        except ValueError:
+            self.log(f"'{raw}' is not a number")
+            return None
+
+    def _find_ready(self) -> bool:
+        if self.pid is None:
+            self.log("attach to the game first — a watchpoint needs ptrace")
+            return False
+        return True
+
+    def find_scan(self) -> None:
+        if not self._find_ready():
+            return
+        kind = dpg.get_value("find_kind")
+        value = self._find_value("find_value")
+        if value is None:
+            self.log("enter the value you see in game")
+            return
+        self.log(f"scanning for {kind} {value}…")
+        threading.Thread(target=self._find_scan_worker, args=(kind, value), daemon=True).start()
+
+    def _find_scan_worker(self, kind: str, value) -> None:
+        try:
+            hits = F.scan_value(self.pid, value, kind)
+            self.q.put(("find_hits", (hits, f"{len(hits)} address(es) hold {value}")))
+        except Exception as exc:
+            self.q.put(("log", f"scan failed: {type(exc).__name__}: {exc}"))
+
+    def find_refine(self) -> None:
+        if not self._find_ready():
+            return
+        if not self.find_hits:
+            self.log("scan first")
+            return
+        kind = dpg.get_value("find_kind")
+        value = self._find_value("find_new")
+        if value is None:
+            self.log("change the value in game, then enter the new number")
+            return
+        self.log(f"refining {len(self.find_hits)} candidates against {value}…")
+        threading.Thread(target=self._find_refine_worker, args=(kind, value), daemon=True).start()
+
+    def _find_refine_worker(self, kind: str, value) -> None:
+        try:
+            hits = F.refine(self.pid, self.find_hits, value, kind)
+            self.q.put(("find_hits", (hits, f"{len(hits)} candidate(s) left after {value}")))
+        except Exception as exc:
+            self.q.put(("log", f"refine failed: {type(exc).__name__}: {exc}"))
+
+    def find_watch(self) -> None:
+        if not self._find_ready():
+            return
+        if not self.find_hits:
+            self.log("scan first")
+            return
+        choice = dpg.get_value("find_list")
+        addr = int(choice, 16) if choice else self.find_hits[0]
+        kind = dpg.get_value("find_kind")
+        size = F.FORMATS.get(kind, ("", 4))[1]
+        self.log(f"watching writes to {addr:#x} — change the value in game now…")
+        threading.Thread(target=self._find_watch_worker, args=(addr, size), daemon=True).start()
+
+    def _find_watch_worker(self, addr: int, size: int) -> None:
+        try:
+            res = F.watch_writes(self.pid, addr, size, timeout=30.0, hits=1)
+        except Exception as exc:
+            res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        self.q.put(("find_watch", res))
+
+    def find_apply(self) -> None:
+        insn = getattr(self, "find_insn", None)
+        if not insn or not self._find_ready():
+            self.log("watch a write first")
+            return
+        threading.Thread(target=self._find_apply_worker, args=(insn,), daemon=True).start()
+
+    def _find_apply_worker(self, insn: dict) -> None:
+        try:
+            patch = F.apply_nop_patch(self.pid, insn, log=lambda m: self.q.put(("log", m)))
+            self.q.put(("find_patched", patch))
+        except Exception as exc:
+            self.q.put(("log", f"patch failed: {type(exc).__name__}: {exc}"))
+
+    def find_undo(self) -> None:
+        if not self.find_patch or not self._find_ready():
+            self.log("nothing to undo")
+            return
+        try:
+            F.undo_nop_patch(self.pid, self.find_patch, log=lambda m: self.q.put(("log", m)))
+            self.find_patch = None
+        except Exception as exc:
+            self.log(f"undo failed: {exc}")
+
     # ------------------------------------------------------------- attach
     def auto_attach(self) -> None:
         """Find the running game and attach.
@@ -627,6 +756,29 @@ class App:
                     key, handle, name = payload
                     self.enabled[key] = handle
                     self.log(f"enabled: {name} (cave {handle['cave']:#x})")
+                elif kind == "find_hits":
+                    hits, msg = payload
+                    self.find_hits = hits
+                    dpg.set_value("find_status", msg)
+                    dpg.configure_item("find_list", items=[f"{h:#x}" for h in hits[:20]])
+                    dpg.set_value("find_writer", "")
+                    self.log(msg)
+                elif kind == "find_watch":
+                    if payload.get("ok"):
+                        self.find_insn = payload.get("instruction")
+                        insn = self.find_insn
+                        text = (f"writer at {payload['rip']:#x}: "
+                                f"{insn['text'] if insn else '?'}")
+                        dpg.set_value("find_writer", text)
+                        self.log(text)
+                        self.log(F.suggest_patch(insn))
+                    else:
+                        dpg.set_value("find_writer", str(payload.get("error")))
+                        self.log(str(payload.get("error")))
+                elif kind == "find_patched":
+                    self.find_patch = payload
+                    self.log(f"patched the writer at {payload['addr']:#x} "
+                             f"(Undo restores {payload['orig'].hex(' ')})")
                 elif kind == "reattach":
                     dpg.set_value(self.status, f"attached to {payload} (module owner)")
                     self.log(f"switched to pid {payload} — it owns the script's module")

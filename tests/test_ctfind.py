@@ -97,6 +97,22 @@ def main() -> int:
                 print("writer instruction:", result["instruction"]["text"],
                       "| suggestion:", ctfind.suggest_patch(result["instruction"]))
 
+        # patching the writer must freeze the value, undo must unfreeze it
+        insn = result.get("instruction")
+        if insn:
+            patch = ctfind.apply_nop_patch(pid, insn)
+            before = ctfind.unpack(C.read_mem(pid, addr, 4), "int32")
+            time.sleep(0.5)
+            frozen = ctfind.unpack(C.read_mem(pid, addr, 4), "int32")
+            if frozen != before:
+                failures.append(f"value kept changing after NOP patch "
+                                f"({before} -> {frozen})")
+            ctfind.undo_nop_patch(pid, patch)
+            time.sleep(0.5)
+            after = ctfind.unpack(C.read_mem(pid, addr, 4), "int32")
+            if after == frozen:
+                failures.append("undo did not restore the write")
+
         proc.kill()
 
     for f in failures:

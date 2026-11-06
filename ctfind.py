@@ -192,6 +192,32 @@ def suggest_patch(insn: dict | None) -> str:
     return f"'{insn['text']}' is the writer — inspect before patching"
 
 
+# ---------------------------------------------------------------- applying it
+def apply_nop_patch(pid: int, insn: dict, log=None) -> dict:
+    """Overwrite the writing instruction with NOPs; remember the original bytes."""
+    addr = insn["addr"]
+    orig = bytes.fromhex(insn["bytes"])
+    patch = b"\x90" * len(orig)
+    INJ.attach(pid)
+    try:
+        INJ.write(pid, addr, patch)
+    finally:
+        INJ.detach(pid)
+    if log:
+        log(f"  patched {addr:#x}: {orig.hex(' ')} -> NOP × {len(orig)}")
+    return {"addr": addr, "orig": orig, "new": patch, "text": insn.get("text", "")}
+
+
+def undo_nop_patch(pid: int, patch: dict, log=None) -> None:
+    INJ.attach(pid)
+    try:
+        INJ.write(pid, patch["addr"], patch["orig"])
+    finally:
+        INJ.detach(pid)
+    if log:
+        log(f"  restored {patch['addr']:#x}: {patch['orig'].hex(' ')}")
+
+
 # ---------------------------------------------------------------- guided flow
 STEPS = {
     "health": "take damage until the number drops (walk into fire, let an enemy hit you)",
