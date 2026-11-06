@@ -109,6 +109,8 @@ class App:
                         with dpg.group(horizontal=True):
                             dpg.add_checkbox(label="Values", tag="show_values",
                                              default_value=True, callback=self.populate_cheats)
+                            dpg.add_checkbox(label="English", tag="show_english",
+                                             default_value=True, callback=self.populate_cheats)
                             dpg.add_checkbox(label="Show raw entries", tag="show_raw",
                                              callback=self.populate_cheats)
                         with dpg.child_window(height=-1, tag="cheat_scroll"):
@@ -261,8 +263,12 @@ class App:
     def _cheat_row(self, c: dict) -> None:
         key = f"{c['category']}/{c['description']}"
         with dpg.table_row():
-            label = c["description"] + ("   (raw)" if c["confidence"] == "low" else "")
-            dpg.add_text(label)
+            english = c.get("description_en") if dpg.get_value("show_english") else None
+            label = (english or c["description"]) + ("   (raw)" if c["confidence"] == "low" else "")
+            text_tag = dpg.add_text(label)
+            if english and english != c["description"]:
+                with dpg.tooltip(text_tag):
+                    dpg.add_text(c["description"])
             cell = dpg.generate_uuid()
             with dpg.group(horizontal=True, tag=cell):
                 if c.get("toggle") and c["kind"] == "script":

@@ -49,6 +49,7 @@ Python 3, no daemons, no root (except one `sysctl` for ptrace — see below).
 | `ctagent.py` | OpenRouter free-model agent (`scan` / `translate`) |
 | `ctdetect.py` | Running/installed-game detection (PID finder + Steam library) |
 | `ctclean.py` | Normalizes `.ct` tables into a clean per-game cheat list (JSON sidecar) |
+| `cttranslate.py` | English labels for non-English cheat names (offline, cached) |
 | `ctlaunch.py` | Launches a Steam game under Proton with the tracer shim loaded |
 | `ctwidgets.py` | Custom controls (the pill switch Dear PyGui lacks) |
 | `cttheme.py` | Material Design (dark) theme + type scale for the GUI |
@@ -109,6 +110,14 @@ Clean the tables once (169 sidecars, ~16k rows out of 57k raw entries):
 python3 ctclean.py                # every game -> ~/.local/share/ctfetch/clean/<Game>.json
 python3 ctclean.py --game "Far Cry 5"
 python3 ctclean.py --stats
+```
+
+Translate the non-English names once (offline; 335 unique strings, 98% resolved):
+
+```bash
+python3 cttranslate.py --stats    # coverage
+python3 cttranslate.py --apply    # writes description_en into the sidecars
+python3 cttranslate.py --review   # what stayed untranslated
 ```
 
 Each cheat gets a confidence: `high` (has an Auto Assembler script), `medium`

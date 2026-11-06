@@ -3,6 +3,17 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-05 (evening)
+**English labels added** (`cttranslate.py`). Only 335 unique non-English names
+exist in the whole library; 213 are already bilingual ("Act pt. / 行動力") and
+215/335 are handled by the bilingual split, 93 by a curated cheat glossary +
+formula patterns ("弹匣不减" → "Unlimited Magazine", "喷射能量不减（火星DLC）" →
+"Unlimited Jetpack Energy (Mars DLC)"), 21 are 2–4 Han-character proper names
+left as-is on purpose. 327/335 (98%) resolved, cached in
+`clean/translations.json` so a manual fix is never re-run. Remaining 8 are
+Japanese source strings and two mixed-language notes — the documented `--llm`
+hook is where those go if wanted.
+
 ## Status — 2026-11-05 (later)
 **Clean list + WeMod-style rows are in.** `ctclean.py` builds sidecars for all 169
 games with tables: 16,119 rows out of 57,849 raw entries (2,075 `high` script
