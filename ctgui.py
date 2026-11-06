@@ -77,6 +77,8 @@ class App:
                     dpg.add_spacer(width=16)
                     dpg.add_button(label="Launch & attach", tag="btn_launch",
                                    callback=self.launch_and_attach)
+                    dpg.add_button(label="Launch via Steam", tag="btn_viasteam",
+                                   callback=self.launch_via_steam_click)
                     dpg.add_button(label="Auto-attach", tag="btn_auto",
                                    callback=self.auto_attach)
                     dpg.add_button(label="Refresh", tag="btn_refresh", callback=self.refresh)
@@ -139,7 +141,7 @@ class App:
             dpg.bind_item_theme(item, T.elevation(level))
         if self.ui.get("primary_button"):
             dpg.bind_item_theme("btn_launch", self.ui["primary_button"])
-        for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_send"):
+        for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_send", "btn_viasteam"):
             if self.ui.get("text_button"):
                 dpg.bind_item_theme(item, self.ui["text_button"])
         for item, role in (("app_title", "headline"), ("lbl_games", "caption"),
@@ -450,11 +452,34 @@ class App:
 
     def _launch_worker(self, game: str) -> None:
         try:
-            res = L.launch(game, wait=True, timeout=240.0)
+            res = L.launch(game, wait=True, timeout=120.0,
+                           log=lambda msg: self.q.put(("log", msg)))
         except Exception as exc:
             res = {"ok": False, "error": repr(exc)}
         res["game"] = game
         self.q.put(("launch", res))
+
+    def launch_via_steam_click(self) -> None:
+        game = self.current_game or (dpg.get_value("game_list") or "").lstrip("▶✓ ")
+        if not game:
+            self.log("select a game first")
+            return
+        self.log(f"asking Steam to launch {game} (Steam's runtime, no tracer shim)")
+        self._chip("warn")
+        dpg.set_value(self.status, f"Steam launching {game}…")
+        threading.Thread(target=lambda g=game: self.q.put(
+            ("steamlaunch", dict(L.launch_via_steam(
+                g, log=lambda m: self.q.put(("log", m))), game=g))), daemon=True).start()
+
+    def _on_steam_launch(self, res: dict) -> None:
+        game = res.get("game", "?")
+        if not res.get("ok"):
+            self.log(f"{game}: Steam launch failed — {res.get('error')}")
+            dpg.set_value(self.status, "launch failed")
+            self._chip("error")
+            return
+        self.log(f"{game}: running as pid {res['pid']} (launched by Steam)")
+        self.attach(int(res["pid"]))
 
     def _on_launch(self, res: dict) -> None:
         game = res.get("game", "?")
@@ -462,13 +487,24 @@ class App:
             self.log(f"note: {warning}")
         if not res.get("ok"):
             self.log(f"launch failed: {res.get('error')}")
+            for hint in res.get("diagnosis") or []:
+                self.log(f"diagnosis: {hint}")
+            if res.get("log_file"):
+                self.log(f"launch log: {res['log_file']}")
             dpg.set_value(self.status, "launch failed")
             self._chip("error")
             return
         self.launched = res
         pid = res.get("pid")
         trace = (res.get("trace") or {}).get("detail", "?")
-        self.log(f"{game} is running (pid {pid}); tracer access {trace}")
+        if res.get("already_running"):
+            self.log(f"{game} was already running (pid {pid}); attaching — tracer access {trace}")
+        else:
+            self.log(f"{game} is running (pid {pid}); tracer access {trace}")
+        for hint in res.get("diagnosis") or []:
+            self.log(f"diagnosis: {hint}")
+        if res.get("log_file"):
+            self.log(f"launch log: {res['log_file']}")
         if game != self.current_game:
             self.current_game = game
             self.cheats = CL.load_clean(game)["cheats"]
@@ -516,8 +552,12 @@ class App:
                     sw = self.switches.get(key)
                     if sw:
                         sw.set(False)
+                elif kind == "log":
+                    self.log(payload)
                 elif kind == "launch":
                     self._on_launch(payload)
+                elif kind == "steamlaunch":
+                    self._on_steam_launch(payload)
         except queue.Empty:
             pass
         dpg.set_frame_callback(dpg.get_frame_count() + 1, self._poll)

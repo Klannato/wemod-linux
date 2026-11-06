@@ -128,9 +128,16 @@ GUI flow: pick a game → **Launch & attach** (starts it through Proton with the
 tracer shim, waits for the process, verifies memory access, attaches) → toggle a
 script cheat or edit a value → or ask the agent "find 100 and set it to 9999".
 
-For a game you started yourself (Steam, Desktop), **Auto-attach** still finds the
-PID, but on a stock kernel the read will be refused — the log says so explicitly
-rather than dying on a stack trace. Launch from the trainer in that case.
+**Launch via Steam** asks the Steam client to start the game. Use it for titles
+that need Steam's runtime container — running Proton directly makes them die with
+`X Error … BadAlloc (GLX)`, which Far Cry 5 does. The catch: Steam's child has no
+tracer shim, so attaching to it needs `sudo setcap cap_sys_ptrace+ep` on a helper
+or `sudo sysctl kernel.yama.ptrace_scope=0`.
+
+Every launch writes a transcript to
+`~/.local/share/ctfetch/logs/launch-<Game>-<timestamp>.log` (the game's own
+stdout/stderr included) and echoes a running commentary — command, env, poll
+ticks every 5 s, and a diagnosis of the known failure patterns — into the GUI log.
 
 The library lands in `~/.local/share/ctfetch/` (`index.json` +
 `tables/<Game>/*.ct`); the API key lives in `~/.config/ctagent/api_key`

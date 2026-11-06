@@ -3,6 +3,27 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-05 (night)
+**Launch debugging added, and the Far Cry 5 blocker identified.** Every launch now
+logs the plan (game/appid/install/proton/exe size), the exact command, cwd, the
+relevant env (`CT_TRACER_PID`, `STEAM_COMPAT_DATA_PATH`, `SteamAppId`, LD_PRELOAD),
+a poll tick every 5 s, and a diagnosis from the transcript tail — plus a full
+transcript file per attempt. `ctlaunch.diagnose()` maps GLX BadAlloc / wrong ELF
+class / "Failed to connect to Steam" / missing redistributable to plain-English
+hints (tests/test_diagnose.py).
+
+What the log then proved about Far Cry 5:
+- a second instance hands off to an existing one, so launching while the game is
+  already up looks like a hang → `launch()` now detects a running instance first
+  and attaches instead;
+- `bin/FarCry5.exe` is a 32-bit stub: `LD_PRELOAD … wrong ELF class: ELFCLASS64`
+  (needs a `-m32` shim for that process);
+- direct Proton launch dies on `X Error … BadAlloc (GLX X_GLXMakeCurrent)` —
+  i.e. it needs Steam's runtime container. **So for titles like this the trainer
+  cannot both launch and trace**: use **Launch via Steam** (added) and grant ptrace
+  via `setcap cap_sys_ptrace+ep` or `ptrace_scope=0`, which is now the documented
+  path rather than a footnote.
+
 ## Status — 2026-11-05 (evening)
 **English labels added** (`cttranslate.py`). Only 335 unique non-English names
 exist in the whole library; 213 are already bilingual ("Act pt. / 行動力") and

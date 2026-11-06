@@ -241,25 +241,95 @@ def pids_for_exe(exe_name: str) -> list[int]:
     return out
 
 
+def _proc_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def _proc_comm(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def game_pid(exe_hint: Path | None, game: str, exclude: int | None = None) -> tuple[int, str] | None:
+    """Find the running instance: (pid, how) where how says which signal matched.
+
+    Three signals, cheapest first:
+      *table*   — the cheat table names the game's exe (needs an aobscanmodule)
+      *mapped*  — a process has the launched exe mapped (wine maps the PE image)
+      *cmdline* — a wine process was started with that exe as its command; the
+                  PE process shows up as `Z:\\…\\Game.exe`, while Proton's own
+                  `steam.exe` wrapper is excluded by name
+    """
+    pids = [p for p in D.running_pids(game) if p != exclude]
+    if pids:
+        return pids[0], "table"
+    if exe_hint is None:
+        return None
+    pids = [p for p in pids_for_exe(exe_hint.name) if p != exclude]
+    if pids:
+        return pids[0], "mapped"
+    needle = exe_hint.name.lower()
+    for pid in pids_for_cmdline(needle, exclude=exclude):
+        return pid, "cmdline"
+    return None
+
+
+def pids_for_cmdline(needle: str, exclude: int | None = None) -> list[int]:
+    """Wine PE processes started with this executable (skips Proton's wrapper)."""
+    out = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == exclude:
+            continue
+        cmd = _proc_cmdline(pid).lower()
+        if needle not in cmd:
+            continue
+        comm = _proc_comm(pid).lower()
+        if comm.startswith("steam.exe") or comm.startswith("python"):
+            continue
+        out.append(pid)
+    return out
+
+
 def wait_for_game(game: str, child: subprocess.Popen, timeout: float = 180.0,
-                  exe_hint: Path | None = None) -> int | None:
+                  exe_hint: Path | None = None, log=None) -> int | None:
     """Poll for the game's PE process; its tree may be reparented by wineserver.
 
     Cheat-table exe names only exist when a table has an `aobscanmodule` (Far
-    Cry 5's is symbol-based, so it has none) — hence the exe_hint fallback, which
-    matches the process by the executable we actually launched.
+    Cry 5's is symbol-based, so it has none) — hence the exe_hint fallbacks.
+    Logs a progress line every 5 s so a slow boot (or a modal launcher dialog)
+    is visible instead of looking like a hang.
     """
     deadline = time.time() + timeout
+    started = time.time()
+    tick = 0
     while time.time() < deadline:
-        procs = D.find_processes()
-        pids = D.running_pids(game, procs)
-        if not pids and exe_hint is not None:
-            pids = [p for p in pids_for_exe(exe_hint.name) if p != child.pid]
-        if pids:
-            return pids[0]
+        found = game_pid(exe_hint, game, exclude=child.pid)
+        if found:
+            if log:
+                log(f"  game process found: pid {found[0]} (matched by {found[1]}) "
+                    f"after {time.time() - started:.1f}s")
+            return found[0]
         if child.poll() is not None:
+            if log:
+                log(f"  launcher exited after {time.time() - started:.1f}s "
+                    f"(no game process appeared)")
             return None
+        waited = time.time() - started
+        if log and int(waited) // 5 > tick:
+            tick = int(waited) // 5
+            log(f"  waiting for {exe_hint.name if exe_hint else game}… {waited:.0f}s "
+                f"(wine procs: {sum(1 for p in Path('/proc').iterdir() if p.name.isdigit() and 'wine' in _proc_cmdline(int(p.name)).lower())})")
         time.sleep(1.0)
+    if log:
+        log(f"  timed out after {timeout:.0f}s waiting for the game process")
     return None
 
 
@@ -283,20 +353,91 @@ def steam_running() -> bool:
     return False
 
 
-def launch(game: str, exe: Path | None = None, timeout: float = 180.0,
-           wait: bool = True) -> dict:
-    """Start `game` under Proton with the tracer shim; return what happened."""
+LOG_DIR = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "ctfetch" / "logs"
+
+
+DIAGNOSES = [
+    (re.compile(r"X Error.*BadAlloc|GLXMakeCurrent", re.I),
+     "graphics context creation failed (GLX BadAlloc): the game was started outside "
+     "Steam's runtime container. Launch it from Steam, then attach."),
+    (re.compile(r"wrong ELF class", re.I),
+     "some processes are 32-bit and ignored the 64-bit tracer shim (needs a -m32 build)"),
+    (re.compile(r"steamclient_init_registry Failed to connect to Steam", re.I),
+     "the Steam client was not reachable; start Steam first"),
+    (re.compile(r"(d3d|d3dx|msvcp|vcruntime|ucrtbase|xinput).{0,140}(not found|missing|failed)", re.I),
+     "a redistributable is missing in this prefix; one launch from Steam installs it"),
+]
+
+
+def diagnose(log_path: Path | str | None, tail: int = 200) -> list[str]:
+    """Turn the tail of a launch transcript into actionable hints."""
+    if not log_path:
+        return []
+    try:
+        lines = Path(log_path).read_text(errors="replace").splitlines()[-tail:]
+    except OSError:
+        return []
+    text = "\n".join(lines)
+    return [hint for pattern, hint in DIAGNOSES if pattern.search(text)]
+
+
+def launch(game: str, exe: Path | None = None, timeout: float = 120.0,
+           wait: bool = True, log=None) -> dict:
+    """Start `game` under Proton with the tracer shim; return what happened.
+
+    `log(msg)` receives a running commentary — every command, env key, poll tick
+    and the tail of the game's own output — so a slow or failing launch is
+    visible in the GUI instead of looking like a frozen window. The full
+    transcript (including proton's stdout/stderr) is also written to
+    `~/.local/share/ctfetch/logs/launch-<game>-<timestamp>.log`.
+    """
+    def say(msg: str) -> None:
+        if log:
+            log(msg)
+
     app = find_app(game)
     if app is None:
+        say(f"{game}: not an installed Steam app")
         return {"ok": False, "error": f"'{game}' is not an installed Steam app"}
     proton = find_proton()
     if proton is None:
+        say("no Proton installation found")
         return {"ok": False, "error": "no Proton installation found"}
+
     target = exe or find_exe(app, game)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    log_path = LOG_DIR / f"launch-{re.sub(r'[^A-Za-z0-9]+', '-', game)}-{stamp}.log"
+    transcript = open(log_path, "w", buffering=1, encoding="utf-8", errors="replace")
+
+    def say2(msg: str) -> None:
+        say(msg)
+        transcript.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+
+    say2(f"launch plan: game={game} appid={app['appid']} install={app['path']}")
+    say2(f"  proton: {proton}  ({proton.parent.name})")
     if target is None:
         skipped = blacklisted_exes(app)
         hint = f" (only installers found: {', '.join(skipped[:3])})" if skipped else ""
+        say2("  no usable executable" + hint)
+        transcript.close()
         return {"ok": False, "error": f"no game executable found under {app['path']}{hint}"}
+    say2(f"  exe: {target}  ({target.stat().st_size / 1e6:.1f} MB)")
+
+    # Already running? Launching a second instance is the usual "hung launch":
+    # the new process hands off to the old one and exits, and we then wait.
+    running = game_pid(target, game)
+    if running:
+        say2(f"  already running: pid {running[0]} (matched by {running[1]}) — "
+             f"attaching instead of launching")
+        ok, detail = trace_ok(running[0])
+        say2(f"  memory access: {detail}")
+        transcript.close()
+        return {"ok": ok, "app": app, "exe": str(target), "pid": running[0],
+                "already_running": True, "trace": {"ok": ok, "detail": detail},
+                "log_file": str(log_path), "warnings": [],
+                "error": None if ok else f"attach refused ({detail}) — the running "
+                                        f"game was not launched by this trainer"}
 
     warnings = []
     prefix = app["steamapps"] / "compatdata" / app["appid"] / "pfx"
@@ -308,24 +449,39 @@ def launch(game: str, exe: Path | None = None, timeout: float = 180.0,
     if not steam_running():
         warnings.append("the Steam client is not running: Steamworks games exit with "
                         "'Failed to connect to Steam' — start Steam first")
+    for warning in warnings:
+        say2(f"  warning: {warning}")
     if not SHIM.exists():
+        transcript.close()
         return {"ok": False, "error": f"tracer shim missing: build {SHIM.with_suffix('.c')}"}
 
     env = launch_env(app)
     cmd = [str(proton), "run", str(target)]
+    say2(f"  command: {' '.join(cmd)}")
+    say2(f"  cwd: {target.parent}")
+    say2(f"  env: CT_TRACER_PID={env.get('CT_TRACER_PID')} "
+         f"STEAM_COMPAT_DATA_PATH={env.get('STEAM_COMPAT_DATA_PATH')} "
+         f"SteamAppId={env.get('SteamAppId')} "
+         f"LD_PRELOAD={env.get('LD_PRELOAD', '').split()[0] if env.get('LD_PRELOAD') else '-'}"
+         f" (+{max(0, len(env.get('LD_PRELOAD', '').split()) - 1)} inherited)")
     try:
         child = subprocess.Popen(cmd, cwd=str(target.parent), env=env,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=transcript, stderr=subprocess.STDOUT)
     except OSError as exc:
-        return {"ok": False, "error": f"spawn failed: {exc}"}
+        say2(f"  spawn failed: {exc}")
+        transcript.close()
+        return {"ok": False, "error": f"spawn failed: {exc}", "log_file": str(log_path)}
+    say2(f"  launcher pid {child.pid}; waiting up to {timeout:.0f}s for the game process")
 
     result = {"ok": True, "app": app, "proton": str(proton), "exe": str(target),
               "launcher_pid": child.pid, "pid": None, "trace": None, "warnings": warnings,
+              "log_file": str(log_path), "already_running": False,
               "shim": str(SHIM), "env_keys": sorted(k for k in env if k.startswith(("STEAM_COMPAT", "CT_")) or k == "LD_PRELOAD")}
     if not wait:
+        transcript.close()
         return result
 
-    pid = wait_for_game(game, child, timeout, exe_hint=target)
+    pid = wait_for_game(game, child, timeout, exe_hint=target, log=say2)
     if pid is None:
         # Nothing appeared: do not leave a hung Proton/wine tree behind (this is
         # exactly how a failed Far Cry 5 launch ended up "still running borked").
@@ -338,14 +494,24 @@ def launch(game: str, exe: Path | None = None, timeout: float = 180.0,
             except Exception:
                 child.kill()
                 cleaned = True
+        say2(f"  cleanup: launcher {'stopped' if cleaned else 'already gone'}")
         result.update(ok=False, error="game process never appeared "
                                      f"({'launcher process stopped' if cleaned else 'launcher already gone'})")
+        result["diagnosis"] = diagnose(log_path)
+        for hint in result["diagnosis"]:
+            say2(f"  diagnosis: {hint}")
+        transcript.close()
         return result
     ok, detail = trace_ok(pid)
+    say2(f"  memory access: {detail}")
     result.update(pid=pid, trace={"ok": ok, "detail": detail})
     if not ok:
         result["ok"] = False
         result["error"] = f"attached refused ({detail}) — shim did not take effect"
+    result["diagnosis"] = diagnose(log_path)
+    for hint in result["diagnosis"]:
+        say2(f"  diagnosis: {hint}")
+    transcript.close()
     return result
 
 
@@ -383,6 +549,50 @@ def self_test() -> int:
     print(f"self-test: pid={pid} trace={detail} preload={env['LD_PRELOAD'].split()[0]}")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def launch_via_steam(game: str, timeout: float = 120.0, log=None) -> dict:
+    """Start the game through the Steam client instead of Proton directly.
+
+    Direct launches bypass Steam's runtime container, and titles that need it die
+    with `X Error … BadAlloc (GLX)` — Far Cry 5 does exactly that. Letting Steam
+    start the game fixes the runtime but costs the tracer shim: the process is
+    Steam's child, so attaching needs CAP_SYS_PTRACE or ptrace_scope=0. The
+    return value says which of those is in play.
+    """
+    def say(msg: str) -> None:
+        if log:
+            log(msg)
+
+    app = find_app(game)
+    if app is None:
+        return {"ok": False, "error": f"'{game}' is not an installed Steam app"}
+    exe = find_exe(app, game)
+    steam = "steam"
+    say(f"asking Steam to launch {game} (appid {app['appid']})")
+    try:
+        subprocess.Popen([steam, "-applaunch", app["appid"]],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        return {"ok": False, "error": f"could not run steam: {exc}"}
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found = game_pid(exe, game)
+        if found:
+            ok, detail = trace_ok(found[0])
+            say(f"  running as pid {found[0]} (Steam's child); memory access: {detail}")
+            if not ok:
+                say("  this game was not launched by the trainer, so the tracer shim "
+                    "is absent: grant ptrace with `sudo setcap cap_sys_ptrace+ep` on a "
+                    "helper, or `sudo sysctl -w kernel.yama.ptrace_scope=0`")
+            return {"ok": ok, "pid": found[0], "app": app, "via": "steam",
+                    "trace": {"ok": ok, "detail": detail},
+                    "error": None if ok else f"attach refused ({detail}) — Steam launched "
+                                            f"this game, so it has no tracer declaration"}
+        time.sleep(2.0)
+    return {"ok": False, "app": app, "via": "steam",
+            "error": f"Steam did not start {game} within {timeout:.0f}s"}
 
 
 def main() -> None:
