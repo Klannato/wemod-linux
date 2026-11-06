@@ -217,15 +217,25 @@ def verify_game(game: str, include_online: bool = False) -> dict:
         for f in sorted(local_dir.glob("*.ct")) + sorted(local_dir.glob("*.CT")):
             tables.append(score_table(f, roots))
     if include_online:
+        # Score downloads in a scratch dir: a candidate that fails the check should
+        # never end up in the game's table folder.
+        import tempfile
+        import ctcheck
         try:
-            import ctcheck
-            for hit in ctcheck.gh_search(game)[:4]:
-                tmp = Path("/tmp") / Path(hit["path"]).name
-                got = ctcheck.fetch(hit, game)
+            hits = ctcheck.gh_search(game)[:4]
+        except Exception:
+            hits = []
+        for hit in hits:
+            with tempfile.TemporaryDirectory() as tmp:
+                dest_dir = Path(tmp) / "tables"
+                orig = ctcheck.LIB
+                ctcheck.LIB = Path(tmp)
+                try:
+                    got = ctcheck.fetch(hit, game)
+                finally:
+                    ctcheck.LIB = orig
                 if got:
                     tables.append(score_table(got, roots))
-        except Exception:
-            pass
     best = max(tables, key=lambda t: (t["matched"], -t["checked"]), default=None)
     return {"game": game, "roots": [str(r) for r in roots], "tables": tables, "best": best}
 
