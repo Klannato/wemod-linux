@@ -80,10 +80,13 @@ def parse_maps(pid: int) -> list[dict]:
     """Parse /proc/<pid>/maps into region dicts (start/end/perms/offset/path)."""
     regions = []
     for line in Path(f"/proc/{pid}/maps").read_text().splitlines():
+        # Anonymous mappings have no path — five fields, not six. Dropping them
+        # (as this did) hides every heap region, which is where game values live.
         parts = line.split(None, 5)
-        if len(parts) < 6:
+        if len(parts) < 5:
             continue
-        addr, perms, offset, _dev, _inode, path = parts
+        addr, perms, offset, _dev, _inode = parts[:5]
+        path = parts[5].strip() if len(parts) > 5 else ""
         s, e = addr.split("-")
         regions.append({
             "start": int(s, 16), "end": int(e, 16), "perms": perms,

@@ -3,6 +3,26 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-06: freshness check + from-scratch discovery
+`ctcheck.py` answers "is there a newer table?" before any heuristic: local table
+mtimes vs the commit date of matching `.CT` files found by `gh search code`.
+Queries must try the compact name ("FarCry5", not "Far Cry 5"), hits must match the
+game stem (`FarCryNewDawn` is not `FarCry5`), and error bodies must never compare as
+dates (tests/test_ctcheck.py). For Far Cry 5 the two online tables are older than
+the local copy, so remapping is correctly the fallback.
+
+`ctfind.py` rebuilds a cheat by observation when no table fits: `scan_value` →
+guided refine (it tells the user what to do in game to change the value) →
+`watch_writes` (ptrace DR0/DR7 hardware watchpoint) → `instruction_ending_at`
+(back-decodes the writer; disassembling from a fixed offset desyncs on x86, so it
+tries every start offset and keeps decodes landing exactly on RIP) →
+`suggest_patch` ("replace `mov dword ptr [rax], edx` with NOPs").
+tests/test_ctfind.py compiles a C writer fixture and verifies the whole chain,
+including that the reported RIP is in executable memory.
+
+Along the way: `ctapply.parse_maps` was dropping **anonymous mappings** (5-field
+lines have no path) — i.e. every heap region, where game values live. Fixed.
+
 ## Status — 2026-11-06: remap engine (agent fallback)
 `ctremap.py` re-locates a cheat when the table's address no longer exists and the
 local ±0x8000 drift search is ambiguous. Evidence ladder, longest first: the hex

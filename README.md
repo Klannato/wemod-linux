@@ -50,6 +50,9 @@ Python 3, no daemons, no root (except one `sysctl` for ptrace — see below).
 | `ctdetect.py` | Running/installed-game detection (PID finder + Steam library) |
 | `ctclean.py` | Normalizes `.ct` tables into a clean per-game cheat list (JSON sidecar) |
 | `cttranslate.py` | English labels for non-English cheat names (offline, cached) |
+| `ctcheck.py` | Is a newer table available? (`gh` code search + commit dates) |
+| `ctremap.py` | Relocate a cheat from the table's own signature |
+| `ctfind.py` | Build a cheat from scratch: value scan → refine → write watchpoint |
 | `ctlaunch.py` | Launches a Steam game under Proton with the tracer shim loaded |
 | `ctwidgets.py` | Custom controls (the pill switch Dear PyGui lacks) |
 | `cttheme.py` | Material Design (dark) theme + type scale for the GUI |
@@ -203,6 +206,23 @@ are validated as real `CheatTable` XML before being accepted.
 - 88% of table entries address memory by an Auto Assembler *symbol* that only
   exists once the table's own script has run — see `HANDOFF.md` for the planned
   symbol registry.
+
+## When a table is incompatible
+
+Order of escalation, cheapest and most reliable first:
+
+```bash
+python3 ctcheck.py "Far Cry 5"            # 1. is there a newer table? (--fetch to grab it)
+# 2. automatic: ctremap re-anchors from the table's own signature (assert + comment bytes)
+python3 ctfind.py <PID> int32 health     # 3. no table? rebuild the cheat by observation
+```
+
+`ctfind` walks you through the human workflow: it scans for the value you see in
+game, tells you what to do to change it ("take damage until health drops", "buy or
+sell something"), refines the candidate list with each new value, then sets a
+hardware watchpoint on the survivor and reports the instruction that writes it
+(`mov dword ptr [rax], edx`) plus the patch it suggests. Watchpoints need ptrace,
+i.e. a game launched by the trainer.
 
 ## Tests
 
