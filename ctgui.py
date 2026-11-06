@@ -329,8 +329,27 @@ class App:
         threading.Thread(target=self._enable_worker, args=(c, key), daemon=True).start()
 
     def _enable_worker(self, c: dict, key: str) -> None:
+        """Enable a script, switching to whichever process owns its modules.
+
+        A game's launcher stub and its engine are separate processes; attaching to
+        the stub and then toggling `FC_m64.dll+114B512` fails with "cannot resolve"
+        while the game is perfectly alive one pid over.
+        """
         try:
-            handle = AA.auto_enable(self.pid, c["script"], self.bases)
+            pid = self.pid
+            modules = L.script_modules(c["script"])
+            if modules:
+                owner = L.pid_for_modules(modules, pid, log=lambda m: self.q.put(("log", m)))
+                if owner and owner != pid:
+                    ok, detail = L.trace_ok(owner)
+                    if not ok:
+                        raise ValueError(f"{modules[0]} lives in pid {owner} but it is "
+                                         f"not readable ({detail})")
+                    self.pid = owner
+                    self.bases = C.module_bases(owner)
+                    pid = owner
+                    self.q.put(("reattach", owner))
+            handle = AA.auto_enable(pid, c["script"], self.bases)
             self.q.put(("aa_ok", (key, handle, c["description"])))
         except Exception as exc:
             self.q.put(("aa_err", (key, c["description"], f"{type(exc).__name__}: {exc}")))
@@ -600,6 +619,9 @@ class App:
                     key, handle, name = payload
                     self.enabled[key] = handle
                     self.log(f"enabled: {name} (cave {handle['cave']:#x})")
+                elif kind == "reattach":
+                    dpg.set_value(self.status, f"attached to {payload} (module owner)")
+                    self.log(f"switched to pid {payload} — it owns the script's module")
                 elif kind == "aa_err":
                     key, name, err = payload
                     self.log(f"enable failed ({name}): {err}")

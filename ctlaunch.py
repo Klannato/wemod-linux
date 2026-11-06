@@ -422,6 +422,77 @@ def diagnose(log_path: Path | str | None, tail: int = 200) -> list[str]:
     return [hint for pattern, hint in DIAGNOSES if pattern.search(text)]
 
 
+def pids_with_module(module: str, exclude: int | None = None) -> list[int]:
+    """Processes that have this PE module mapped.
+
+    A game's launcher stub and its engine are different processes: the stub we
+    attach to first has no `FC_m64.dll`, so a script addressing
+    `FC_m64.dll+114B512` fails with "module not loaded" even though the game is
+    running fine a few seconds later.
+    """
+    needle = module.lower()
+    out = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == exclude:
+            continue
+        try:
+            maps = (entry / "maps").read_text(errors="replace").lower()
+        except OSError:
+            continue
+        if needle in maps:
+            out.append(pid)
+    return out
+
+
+def script_modules(script: str) -> list[str]:
+    """Module names an AA script addresses (`aobscanmodule(..., M)` or `M+off`)."""
+    found = []
+    for m in re.finditer(r"aobscanmodule\s*\(\s*[^,]+,\s*([A-Za-z0-9_.\-]+)", script, re.I):
+        found.append(m.group(1))
+    for m in re.finditer(r"^\s*([A-Za-z0-9_.\-]+\.(?:dll|exe))\s*\+", script, re.I | re.M):
+        found.append(m.group(1))
+    # keep order, drop duplicates
+    seen, out = set(), []
+    for name in found:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(name)
+    return out
+
+
+def pid_for_modules(modules: list[str], attached: int | None, log=None) -> int | None:
+    """Pick the process that actually owns a script's modules."""
+    if attached is not None:
+        try:
+            bases = C_module_bases(attached)
+        except Exception:
+            bases = {}
+        if all(any(m.lower() == b for b in bases) for m in modules):
+            return attached
+    for module in modules:
+        owners = pids_with_module(module, exclude=attached)
+        if not owners:
+            continue
+        # prefer a wine PE process (comm *.exe) over a wineserver/loader
+        def rank(pid: int) -> tuple:
+            comm = _proc_comm(pid).lower()
+            return (not comm.endswith(".exe"), not shim_loaded(pid), pid)
+        pick = sorted(owners, key=rank)[0]
+        if log:
+            log(f"  {module} is in pid {pick} — attaching there instead of {attached}")
+        return pick
+    return attached
+
+
+def C_module_bases(pid: int) -> dict:
+    import ctapply as _C
+    return _C.module_bases(pid)
+
+
 def wine_prefix(app: dict) -> Path:
     """Proton's WINEPREFIX for this app: `<compatdata>/<appid>/pfx/` (with the
     trailing slash Proton itself uses — a wineserver started with a different
