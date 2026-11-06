@@ -3,6 +3,22 @@
 Repo `~/wemod-linux` (branch main, remote `Klannato/wemod-linux`). Skill: `cheat-table-scraping`.
 Scope: single-player/offline only.
 
+## Status — 2026-11-06: offline table/build verification
+`ctcompat.py` proves whether a table matches the installed build **without
+launching the game**: it reads every `assert(MODULE+offset, bytes)` out of a
+table, resolves the module to the file on disk (minimal PE parse → RVA to file
+offset) and compares bytes. Per table it reports matched/checked, the observed
+drifts, and whether remapping is safe.
+
+Far Cry 5 result: `0/21 asserts` — and the drifts are **not uniform**
+(`+0x1050`, `+0x12f0`), so a single shift is meaningless. That is exactly why the
+automatic +0x1050 patch at 20:00:43 crashed the game, and why shifted patches now
+require confirmation plus an instruction-alignment check before any write.
+Verdicts: matches / different build / different build (inconsistent drift) / partial.
+
+The GUI runs this on game selection ("0/21 asserts match this build") and behind a
+**Check table** button, and the shift-confirmation modal shows it.
+
 ## Status — 2026-11-06: freshness check + from-scratch discovery
 `ctcheck.py` answers "is there a newer table?" before any heuristic: local table
 mtimes vs the commit date of matching `.CT` files found by `gh search code`.

@@ -51,6 +51,7 @@ Python 3, no daemons, no root (except one `sysctl` for ptrace — see below).
 | `ctclean.py` | Normalizes `.ct` tables into a clean per-game cheat list (JSON sidecar) |
 | `cttranslate.py` | English labels for non-English cheat names (offline, cached) |
 | `ctcheck.py` | Is a newer table available? (`gh` code search + commit dates) |
+| `ctcompat.py` | Score a table against the installed build, offline (asserts vs the DLL on disk) |
 | `ctremap.py` | Relocate a cheat from the table's own signature |
 | `ctfind.py` | Build a cheat from scratch: value scan → refine → write watchpoint |
 | `ctlaunch.py` | Launches a Steam game under Proton with the tracer shim loaded |
@@ -213,6 +214,7 @@ Order of escalation, cheapest and most reliable first:
 
 ```bash
 python3 ctcheck.py "Far Cry 5"            # 1. is there a newer table? (--fetch to grab it)
+python3 ctcompat.py "Far Cry 5"           # 1b. does my table actually match my build?
 # 2. automatic: ctremap re-anchors from the table's own signature (assert + comment bytes)
 python3 ctfind.py <PID> int32 health     # 3. no table? rebuild the cheat by observation
 ```

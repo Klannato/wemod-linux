@@ -396,7 +396,8 @@ def find_code_cave(pid: int, size: int, scan_limit: int = 0x40000) -> int | None
     return None
 
 
-def auto_enable(pid: int, script_text: str, bases: dict | None = None) -> dict:
+def auto_enable(pid: int, script_text: str, bases: dict | None = None,
+                allow_shifted: bool = False) -> dict:
     """Full AA enable with auto-discovery — the real-game entry point.
 
     Two shapes exist in the wild and both are handled here:
@@ -425,7 +426,7 @@ def auto_enable(pid: int, script_text: str, bases: dict | None = None) -> dict:
                          "implemented (needs CreateRemoteThread or a cave + hook)")
     inplace = parse_inplace(script_text)
     if inplace["blocks"]:
-        return apply_inplace(pid, script_text, bases)
+        return apply_inplace(pid, script_text, bases, allow_shifted=allow_shifted)
     raise ValueError("script has neither an AOB scan nor a direct-address block "
                      "(nothing to enable)")
 
@@ -508,7 +509,26 @@ def _find_shift(pid: int, addr: int, want: bytes, window: int = 0x8000) -> int |
     return pick[0] - addr
 
 
-def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict:
+def _site_instruction(pid: int, addr: int, length: int) -> dict | None:
+    """Decode the instruction starting at `addr` and compare its width.
+
+    Patching five bytes at an address that is not the start of a five-byte
+    instruction leaves garbage prefixes behind and crashes the game — the failure
+    seen with Far Cry 5 at 20:00:43 after a +0x1050 drift was applied blind.
+    """
+    try:
+        blob = INJ.read(pid, addr, 16)
+    except OSError:
+        return None
+    insn = next(_MD.disasm(blob, addr), None)
+    if insn is None:
+        return None
+    return {"len": insn.size, "text": f"{insn.mnemonic} {insn.op_str}".strip(),
+            "aligned": insn.size == length}
+
+
+def apply_inplace(pid: int, script_text: str, bases: dict | None = None,
+                  allow_shifted: bool = False) -> dict:
     """Patch bytes at absolute (module+offset) addresses; remember the originals."""
     bases = bases or C.module_bases(pid)
     parsed = parse_inplace(script_text)
@@ -557,12 +577,23 @@ def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict
                     f"{found} — this table is for a different game build and the shift "
                     f"is not unambiguous")
             shift = shifts.pop()
+        if shift and not allow_shifted:
+            raise ValueError(
+                f"table drift {shift:+#x} — this patch would land on a different "
+                f"address than the table was written for. Confirm it explicitly "
+                f"(the game can crash if the instruction there is not the same)")
         for block in parsed["blocks"]:
             addr = _resolve_addr(block["expr"], bases) + shift
             asm = "\n".join(_ce_normalize(line) for line in block["lines"])
             code = INJ.assemble(asm, base_addr=addr)
             if not code:
                 raise ValueError(f"nothing assembled for {block['expr']}")
+            site = _site_instruction(pid, addr, len(code))
+            if site is not None and not site["aligned"]:
+                raise ValueError(
+                    f"refusing to patch {addr:#x}: a {len(code)}-byte patch would "
+                    f"land mid-instruction (site holds a {site['len']}-byte "
+                    f"'{site['text']}')")
             orig = INJ.read(pid, addr, len(code))
             INJ.write(pid, addr, code)
             patches.append({"addr": addr, "orig": orig, "new": code,
@@ -570,7 +601,7 @@ def apply_inplace(pid: int, script_text: str, bases: dict | None = None) -> dict
     finally:
         INJ.detach(pid)
     return {"type": "inplace", "pid": pid, "patches": patches, "shift": shift,
-            "remap": remap_info}
+            "remap": remap_info, "shifted": bool(shift)}
 
 
 def auto_disable(pid: int, handle: dict) -> None:

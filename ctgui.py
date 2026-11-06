@@ -16,6 +16,7 @@ PTRACE_ATTACH are refused with EPERM.
 
 Run:  python3 ctgui.py
 """
+import json
 import queue
 import sys
 import threading
@@ -29,6 +30,7 @@ import ctapply as C
 import ctaa as AA
 import ctagent as G
 import ctclean as CL
+import ctcompat as CC
 import ctdetect as D
 import ctfind as F
 import ctlaunch as L
@@ -71,6 +73,7 @@ class App:
         self.launched: dict | None = None
         self.find_hits: list[int] = []
         self.find_patch: dict | None = None
+        self.compat: dict | None = None
         self._suspend_select = False    # configure_item(items=...) fires the callback
 
     # ------------------------------------------------------------- widget tree
@@ -113,6 +116,10 @@ class App:
                             dpg.add_text("CHEATS", tag="lbl_cheats")
                             dpg.add_spacer(width=10)
                             self.cheat_count = dpg.add_text("", tag="cheat_count")
+                            dpg.add_spacer(width=12)
+                            self.compat_text = dpg.add_text("", tag="compat_text")
+                            dpg.add_button(label="Check table", tag="btn_compat",
+                                           callback=self.check_compat)
                         dpg.add_input_text(tag="cheat_filter", hint="search cheats",
                                            width=-1, callback=self.populate_cheats)
                         with dpg.group(horizontal=True):
@@ -174,7 +181,7 @@ class App:
         if self.ui.get("primary_button"):
             dpg.bind_item_theme("btn_launch", self.ui["primary_button"])
         for item in ("btn_auto", "btn_refresh", "btn_detach", "btn_send",
-                     "btn_viasteam", "btn_kill"):
+                     "btn_viasteam", "btn_kill", "btn_compat"):
             if self.ui.get("text_button"):
                 dpg.bind_item_theme(item, self.ui["text_button"])
         for item, role in (("app_title", "headline"), ("lbl_games", "caption"),
@@ -230,6 +237,9 @@ class App:
         self.enabled.clear()
         self.log(f"{game}: {len(self.cheats)} cleaned cheats")
         self.populate_cheats()
+        self.compat = None
+        dpg.set_value("compat_text", "checking table…")
+        threading.Thread(target=self._compat_worker, args=(game,), daemon=True).start()
 
     # ------------------------------------------------------------- cheat list
     def _visible_cheats(self) -> list[dict]:
@@ -387,6 +397,11 @@ class App:
                 self.q.put(("log", f"  table drift {shift:+#x}: patched at the shifted "
                                    f"address (this table was made for another build)"))
             self.q.put(("aa_ok", (key, handle, c["description"])))
+        except ValueError as exc:
+            if "Confirm it explicitly" in str(exc):
+                self.q.put(("aa_confirm", (key, c, str(exc), pid)))
+                return
+            self.q.put(("aa_err", (key, c["description"], f"{type(exc).__name__}: {exc}")))
         except Exception as exc:
             self.q.put(("aa_err", (key, c["description"], f"{type(exc).__name__}: {exc}")))
 
@@ -435,12 +450,108 @@ class App:
         else:
             self._on_value_toggle(c, "", True)
 
+    def _confirm_shifted(self, payload) -> None:
+        """A drifted patch may not be the same instruction — ask, never assume."""
+        key, c, reason, pid = payload
+        if dpg.does_item_exist("shift_modal"):
+            dpg.delete_item("shift_modal")
+        with dpg.window(label="Patch may be for another build", modal=True, width=560,
+                        height=200, tag="shift_modal", pos=(330, 260)):
+            if self.compat:
+                dpg.add_text(f"Table check: {self.compat['matched']}/"
+                             f"{self.compat['checked']} asserts match this build "
+                             f"({self.compat['verdict']})", wrap=520)
+            dpg.add_text(reason, wrap=520)
+            dpg.add_text("The game can crash if these bytes are not the same "
+                         "instruction. Apply anyway?", wrap=520)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Apply anyway", tag="btn_shift_yes",
+                               callback=lambda: self._confirm_shifted_apply(key, c, pid))
+                dpg.add_button(label="Cancel", tag="btn_shift_no",
+                               callback=lambda: self._confirm_shifted_cancel(key))
+        if self.ui.get("primary_button"):
+            dpg.bind_item_theme("btn_shift_yes", self.ui["primary_button"])
+        if self.ui.get("text_button"):
+            dpg.bind_item_theme("btn_shift_no", self.ui["text_button"])
+
+    def _confirm_shifted_apply(self, key: str, c: dict, pid: int) -> None:
+        dpg.delete_item("shift_modal")
+        self.log(f"applying shifted patch for {c['description']} (confirmed)…")
+        threading.Thread(target=self._confirm_worker, args=(key, c, pid), daemon=True).start()
+
+    def _confirm_shifted_cancel(self, key: str) -> None:
+        dpg.delete_item("shift_modal")
+        sw = self.switches.get(key)
+        if sw:
+            sw.set(False)
+        self.log("shifted patch cancelled")
+
+    def _confirm_worker(self, key: str, c: dict, pid: int) -> None:
+        try:
+            handle = AA.auto_enable(pid, c["script"], self.bases, allow_shifted=True)
+            self.q.put(("aa_ok", (key, handle, c["description"])))
+        except Exception as exc:
+            self.q.put(("aa_err", (key, c["description"], f"{type(exc).__name__}: {exc}")))
+
+    def _watch_for_crash(self, game: str, cheat: str, pid: int) -> None:
+        """If the game dies within a few seconds of a patch, say so and remember it."""
+        import time as _t
+        for _ in range(6):
+            _t.sleep(1.0)
+            if not Path(f"/proc/{pid}").exists():
+                self.q.put(("crash", (game, cheat)))
+                return
+
     def _apply_worker(self, c: dict) -> None:
         try:
             AA.auto_enable(self.pid, c["script"], self.bases)
             self.q.put(("chat", f"applied: {c['description']}"))
         except Exception as exc:
             self.q.put(("chat", f"apply failed ({c['description']}): {exc}"))
+
+    # ------------------------------------------------------------- table compat
+    def _compat_worker(self, game: str) -> None:
+        try:
+            res = CC.verify_game(game)
+        except Exception as exc:
+            self.q.put(("compat", {"game": game, "tables": [], "best": None,
+                                   "error": f"{type(exc).__name__}: {exc}"}))
+            return
+        self.q.put(("compat", res))
+
+    def check_compat(self) -> None:
+        game = self.current_game
+        if not game:
+            self.log("select a game first")
+            return
+        dpg.set_value("compat_text", "checking table…")
+        threading.Thread(target=self._compat_worker, args=(game,), daemon=True).start()
+
+    def _on_compat(self, res: dict) -> None:
+        game = res.get("game", "?")
+        if res.get("error"):
+            dpg.set_value("compat_text", "compat check failed")
+            self.log(f"{game}: compat check failed — {res['error']}")
+            return
+        tables = res.get("tables") or []
+        if not tables:
+            dpg.set_value("compat_text", "no tables to check")
+            return
+        best = res.get("best") or tables[0]
+        self.compat = best
+        summary = (f"{best['matched']}/{best['checked']} asserts match this build"
+                   if best["checked"] else "no direct-address asserts")
+        dpg.set_value("compat_text", summary)
+        self.log(f"{game}: {best['table']} — {summary} ({best['verdict']})")
+        if best.get("drifts"):
+            self.log(f"  observed drifts: {', '.join(best['drifts'][:6])}"
+                     + ("  (inconsistent — remapping cannot be trusted)"
+                        if not best.get("remap_safe") else ""))
+        for sample in (best.get("samples") or [])[:3]:
+            if "rva" in sample:
+                self.log(f"  {sample['module']}+{sample['rva']}: expected "
+                         f"{sample['expected']}, found {sample['actual']}"
+                         + (f", drift {sample['drift']}" if sample.get("drift") else ""))
 
     # ------------------------------------------------------------- find cheat
     def _find_value(self, tag: str):
@@ -755,7 +866,30 @@ class App:
                 elif kind == "aa_ok":
                     key, handle, name = payload
                     self.enabled[key] = handle
-                    self.log(f"enabled: {name} (cave {handle['cave']:#x})")
+                    if isinstance(handle, dict) and handle.get("type") == "inplace":
+                        self.log(f"enabled: {name} ({len(handle.get('patches', []))} patch(es))")
+                    else:
+                        self.log(f"enabled: {name} (cave {handle.get('cave', 0):#x})")
+                    if self.current_game and self.pid:
+                        threading.Thread(target=self._watch_for_crash,
+                                         args=(self.current_game, name, self.pid),
+                                         daemon=True).start()
+                elif kind == "compat":
+                    self._on_compat(payload)
+                elif kind == "aa_confirm":
+                    self._confirm_shifted(payload)
+                elif kind == "crash":
+                    game, cheat = payload
+                    self.log(f"!! the game exited right after patching '{cheat}' — that "
+                             f"patch is unsafe on this build (not retrying automatically)")
+                    try:
+                        unsafe_path = L.LOG_DIR.parent / "clean" / "unsafe.json"
+                        unsafe = json.loads(unsafe_path.read_text()) if unsafe_path.exists() else {}
+                        unsafe.setdefault(game, {})[cheat] = time.strftime("%Y-%m-%d %H:%M")
+                        unsafe_path.parent.mkdir(parents=True, exist_ok=True)
+                        unsafe_path.write_text(json.dumps(unsafe, indent=1, ensure_ascii=False))
+                    except OSError:
+                        pass
                 elif kind == "find_hits":
                     hits, msg = payload
                     self.find_hits = hits

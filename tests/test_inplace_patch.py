@@ -94,12 +94,42 @@ def main() -> int:
     time.sleep(0.2)
     drifted = (SCRIPT.format(addr=hex(addr + 0x1FC0))
                .replace("F3 0F 58 73 10", "F3 0F 59 73 10"))
-    handle2 = AA.auto_enable(pid, drifted, bases={})
+    # a shifted patch must be opted into explicitly
+    try:
+        AA.auto_enable(pid, drifted, bases={})
+        failures.append("shifted patch was applied without confirmation")
+    except ValueError as exc:
+        if "Confirm it explicitly" not in str(exc):
+            failures.append(f"unexpected refusal for shifted patch: {exc}")
+    handle2 = AA.auto_enable(pid, drifted, bases={}, allow_shifted=True)
     if not handle2.get("shift"):
         failures.append(f"no drift detected (shift={handle2.get('shift')})")
     AA.auto_disable(pid, handle2)
     if read(pid, addr + 0x2000) != DRIFT[:5]:
         failures.append("drifted patch did not restore the bytes at the shifted address")
+
+    # a patch that would start mid-instruction must be refused
+    page_addr = addr + 0x3000
+    mis = f"""[ENABLE]
+assert({hex(page_addr)},31 C0 90)
+
+{hex(page_addr)}:
+  nop 5
+[DISABLE]
+{hex(page_addr)}:
+  DB 31 C0 90
+"""
+    INJ.attach(pid)
+    try:
+        INJ.write(pid, page_addr, bytes.fromhex("31C0909090"))   # 2-byte insn + nops
+    finally:
+        INJ.detach(pid)
+    try:
+        AA.auto_enable(pid, mis, bases={})
+        failures.append("mid-instruction patch was applied")
+    except ValueError as exc:
+        if "mid-instruction" not in str(exc):
+            failures.append(f"unexpected refusal for misaligned patch: {exc}")
 
     # wrong assert must refuse, not patch
     bad = SCRIPT.format(addr=hex(addr)).replace("F3 0F 58 73 10)\n\n", "AA BB CC DD EE)\n\n")
