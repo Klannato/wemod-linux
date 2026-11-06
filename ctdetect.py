@@ -89,7 +89,13 @@ def running_pids(game: str, procs: dict[str, list[int]] | None = None) -> list[i
         procs = find_processes()
     pids: set[int] = set()
     for exe in game_exe_names(game):
-        pids.update(procs.get(exe, []))
+        # Native Linux builds ship a binary without the .exe suffix that the
+        # Windows-oriented .ct table names; try both forms.
+        candidates = {exe}
+        if exe.endswith(".exe"):
+            candidates.add(exe[:-4])
+        for cand in candidates:
+            pids.update(procs.get(cand, []))
     return sorted(pids)
 
 

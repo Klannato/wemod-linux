@@ -578,10 +578,15 @@ def apply_inplace(pid: int, script_text: str, bases: dict | None = None,
                     f"is not unambiguous")
             shift = shifts.pop()
         if shift and not allow_shifted:
-            raise ValueError(
-                f"table drift {shift:+#x} — this patch would land on a different "
-                f"address than the table was written for. Confirm it explicitly "
-                f"(the game can crash if the instruction there is not the same)")
+            # Signature evidence is not arithmetic: ctremap found the table's own
+            # long signature exactly once in the module and the assert bytes sit
+            # inside it, so the site is identified by content. A bare drift search
+            # (the Far Cry 5 +0x1050 crash) still has to be confirmed by the user.
+            if not (remap_info and remap_info.get("signature_len", 0) >= 8):
+                raise ValueError(
+                    f"table drift {shift:+#x} — this patch would land on a different "
+                    f"address than the table was written for. Confirm it explicitly "
+                    f"(the game can crash if the instruction there is not the same)")
         for block in parsed["blocks"]:
             addr = _resolve_addr(block["expr"], bases) + shift
             asm = "\n".join(_ce_normalize(line) for line in block["lines"])
